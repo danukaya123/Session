@@ -494,64 +494,95 @@
         }
       }
 
-      document.getElementById("submit").addEventListener("click", async (e) => {
-        e.preventDefault();
+// In your frontend HTML, update the axios response handling:
+document.getElementById("submit").addEventListener("click", async (e) => {
+    e.preventDefault();
 
-        const mobileNumberInput = document.getElementById("mobileNumber");
-        const codeDisplay = document.getElementById("codeDisplay");
-        const qrDisplay = document.getElementById("qrDisplay");
-        const loadingSpinner = document.getElementById("loading");
+    const mobileNumberInput = document.getElementById("mobileNumber");
+    const codeDisplay = document.getElementById("codeDisplay");
+    const qrDisplay = document.getElementById("qrDisplay");
+    const loadingSpinner = document.getElementById("loading");
 
-        const mobileNumber = mobileNumberInput.value.trim();
-        if (!mobileNumber) {
-          codeDisplay.innerHTML =
+    const mobileNumber = mobileNumberInput.value.trim();
+    if (!mobileNumber) {
+        codeDisplay.innerHTML =
             '<div class="error-message"><i class="fas fa-exclamation-circle"></i> Please enter your WhatsApp number</div>';
-          return;
-        }
+        return;
+    }
 
-        loadingSpinner.style.display = "block";
-        codeDisplay.innerHTML = "";
-        qrDisplay.style.display = "none";
+    loadingSpinner.style.display = "block";
+    codeDisplay.innerHTML = "";
+    qrDisplay.style.display = "none";
 
-        try {
-          const response = await axios(
-            `/pair?number=${mobileNumber.replace(/[^0-9]/g, "")}`,
-          );
+    try {
+        // Use the raw number (without +)
+        const cleanNumber = mobileNumber.replace(/[^0-9]/g, "");
+        const response = await axios.get(`/pair?number=${cleanNumber}`);
 
-          const code = response.data.code || "Service Unavailable";
-          if (code === "Service Unavailable") {
+        // Check for success
+        if (response.data.success === false) {
             codeDisplay.innerHTML =
-              '<div class="error-message"><i class="fas fa-exclamation-circle"></i> Service Unavailable</div>';
-          } else {
-            codeDisplay.innerHTML = `<div class="success-message"><i class="fas fa-check-circle"></i> CODE: ${code}</div>`;
-          }
-          codeDisplay.style.display = "flex";
-        } catch (error) {
-          console.error("Error generating code:", error);
-          codeDisplay.innerHTML =
-            '<div class="error-message"><i class="fas fa-exclamation-circle"></i> Error generating code. Please try again.</div>';
-          codeDisplay.style.display = "flex";
-        } finally {
-          loadingSpinner.style.display = "none";
+                `<div class="error-message"><i class="fas fa-exclamation-circle"></i> ${response.data.message || 'Error'}</div>`;
+        } else if (response.data.pairingCode) {
+            const code = response.data.pairingCode;
+            codeDisplay.innerHTML = `
+                <div style="text-align: center;">
+                    <div class="success-message"><i class="fas fa-check-circle"></i> PAIRING CODE</div>
+                    <div style="font-size: 28px; font-weight: bold; margin: 10px 0; letter-spacing: 2px;">${code}</div>
+                    <div style="font-size: 12px; color: #666; margin-top: 10px;">
+                        ${response.data.instructions ? response.data.instructions.join('<br>') : 'Enter this code in WhatsApp Linked Devices'}
+                    </div>
+                    ${response.data.note ? `<div style="font-size: 11px; color: #ff9800; margin-top: 8px; background: #fff3cd; padding: 8px; border-radius: 4px;">${response.data.note}</div>` : ''}
+                </div>`;
+        } else {
+            codeDisplay.innerHTML =
+                '<div class="error-message"><i class="fas fa-exclamation-circle"></i> No pairing code received</div>';
         }
-      });
-      function copyCode() {
-        const codeDisplay = document.getElementById("codeDisplay").innerText;
-        const code = codeDisplay.replace("CODE: ", "");
-        navigator.clipboard
-          .writeText(code)
-          .then(() => {
-            const copyBtn = document.getElementById("copy");
-            const originalText = copyBtn.innerHTML;
-            copyBtn.innerHTML = '<i class="fas fa-check"></i> Copied!';
-            setTimeout(() => {
-              copyBtn.innerHTML = originalText;
-            }, 2000);
-          })
-          .catch((err) => {
-            console.error("Failed to copy text: ", err);
-          });
-      }
+        codeDisplay.style.display = "flex";
+    } catch (error) {
+        console.error("Error generating code:", error);
+        
+        let errorMessage = "Error generating code. Please try again.";
+        if (error.response) {
+            if (error.response.status === 400) {
+                errorMessage = error.response.data.message || "Invalid phone number format";
+            } else if (error.response.status === 409) {
+                errorMessage = error.response.data.message || "Session already exists for this number";
+            } else if (error.response.status === 503) {
+                errorMessage = error.response.data.message || "Service temporarily unavailable";
+            }
+        }
+        
+        codeDisplay.innerHTML =
+            `<div class="error-message"><i class="fas fa-exclamation-circle"></i> ${errorMessage}</div>`;
+        codeDisplay.style.display = "flex";
+    } finally {
+        loadingSpinner.style.display = "none";
+    }
+});
+
+// Update copy function to handle new format
+function copyCode() {
+    const codeDisplay = document.getElementById("codeDisplay");
+    // Extract just the code (format: XXXX-XXXX)
+    const codeMatch = codeDisplay.innerText.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/);
+    
+    if (codeMatch) {
+        const code = codeMatch[0];
+        navigator.clipboard.writeText(code)
+            .then(() => {
+                const copyBtn = document.getElementById("copy");
+                const originalText = copyBtn.innerHTML;
+                copyBtn.innerHTML = '<i class="fas fa-check"></i> Copied!';
+                setTimeout(() => {
+                    copyBtn.innerHTML = originalText;
+                }, 2000);
+            })
+            .catch((err) => {
+                console.error("Failed to copy text: ", err);
+            });
+    }
+}
     </script>
   </body>
 </html>
