@@ -15,9 +15,6 @@ import { sessionDB } from "./database.js";
 
 const router = express.Router();
 
-// Store active sessions to prevent immediate closure
-const activeSessions = new Map();
-
 function removeFile(FilePath) {
     try {
         if (!fs.existsSync(FilePath)) return false;
@@ -28,242 +25,159 @@ function removeFile(FilePath) {
 }
 
 router.get("/", async (req, res) => {
-    try {
-        let num = req.query.number;
-        
-        if (!num) {
+    let num = req.query.number;
+    let dirs = "./" + (num || `session`);
+
+    await removeFile(dirs);
+
+    num = num.replace(/[^0-9]/g, "");
+
+    const phone = pn("+" + num);
+    if (!phone.isValid()) {
+        if (!res.headersSent) {
             return res.status(400).send({
-                success: false,
-                message: "Phone number is required"
+                code: "Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, 84987654321 for Vietnam, etc.) without + or spaces.",
             });
         }
-        
-        // Clean the number
-        num = num.replace(/[^0-9]/g, "");
-        
-        // Validate phone number
-        const phone = pn("+" + num);
-        if (!phone.isValid()) {
-            return res.status(400).send({
-                success: false,
-                message: "Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, 84987654321 for Vietnam, etc.) without + or spaces."
+        return;
+    }
+    num = phone.getNumber("e164").replace("+", "");
+
+    async function initiateSession() {
+        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+
+        try {
+            const { version, isLatest } = await fetchLatestBaileysVersion();
+            let KnightBot = makeWASocket({
+                version,
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(
+                        state.keys,
+                        pino({ level: "fatal" }).child({ level: "fatal" }),
+                    ),
+                },
+                printQRInTerminal: false,
+                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+                browser: Browsers.windows("Chrome"),
+                markOnlineOnConnect: false,
+                generateHighQualityLinkPreview: false,
+                defaultQueryTimeoutMs: 60000,
+                connectTimeoutMs: 60000,
+                keepAliveIntervalMs: 30000,
+                retryRequestDelayMs: 250,
+                maxRetries: 5,
             });
-        }
-        
-        num = phone.getNumber("e164").replace("+", "");
-        console.log(`📱 Processing pair request for: ${num}`);
-        
-        // Check if session already exists
-        const existingSession = await sessionDB.getSession(num);
-        if (existingSession) {
-            return res.status(409).send({
-                success: false,
-                message: "Session already exists for this number. Please delete it first or use a different number."
-            });
-        }
-        
-        const dirs = `./sessions/pair_${num}_${Date.now()}`;
-        
-        // Remove any existing directory
-        await removeFile(dirs);
-        
-        // Create directory
-        if (!fs.existsSync(dirs)) {
-            fs.mkdirSync(dirs, { recursive: true });
-        }
-        
-        let responseSent = false;
-        let knightBot = null;
-        
-        async function initiateSession() {
-            const { state, saveCreds } = await useMultiFileAuthState(dirs);
-            
-            try {
-                const { version } = await fetchLatestBaileysVersion();
-                
-                knightBot = makeWASocket({
-                    version,
-                    auth: {
-                        creds: state.creds,
-                        keys: makeCacheableSignalKeyStore(
-                            state.keys,
-                            pino({ level: "fatal" }).child({ level: "fatal" }),
-                        ),
-                    },
-                    printQRInTerminal: false,
-                    logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-                    browser: Browsers.windows("Chrome"),
-                    markOnlineOnConnect: false,
-                    generateHighQualityLinkPreview: false,
-                    defaultQueryTimeoutMs: 60000,
-                    connectTimeoutMs: 60000,
-                    keepAliveIntervalMs: 30000,
-                    retryRequestDelayMs: 250,
-                    maxRetries: 5,
-                });
-                
-                // Store in active sessions
-                activeSessions.set(num, { knightBot, dirs });
-                
-                knightBot.ev.on("connection.update", async (update) => {
-                    const { connection, lastDisconnect, isNewLogin, isOnline } = update;
-                    
-                    console.log(`🔗 ${num}: Connection update:`, connection);
-                    
-                    if (connection === "open") {
-                        console.log(`✅ ${num}: Connected successfully via pair code!`);
-                        
-                        try {
-                            // Read credentials from file
-                            const credsPath = dirs + "/creds.json";
-                            if (fs.existsSync(credsPath)) {
-                                const credentials = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                                
-                                // Save to MongoDB
-                                await sessionDB.saveSession({
-                                    phoneNumber: num,
-                                    sessionType: 'pair',
-                                    credentials: credentials,
-                                    deviceInfo: {
-                                        platform: 'web',
-                                        browser: 'Chrome',
-                                        userAgent: req.headers['user-agent'] || 'Unknown'
-                                    }
-                                });
-                                
-                                console.log(`💾 ${num}: Session saved to MongoDB`);
-                                
-                                // Send success message to user
-                                const userJid = jidNormalizedUser(num + "@s.whatsapp.net");
-                                
-                                await knightBot.sendMessage(userJid, {
-                                    text: `✅ *SESSION SAVED SUCCESSFULLY!*\n\n📱 Your WhatsApp bot is now connected!\n\n🔑 Session ID: ${num}\n⏰ Expires: 90 days\n\n📊 *Bot Features:*\n• Auto-reply messages\n• Group management\n• Media downloader\n• And much more!\n\nType *.menu* to see all commands.`
-                                });
-                                
-                                console.log(`📩 ${num}: Welcome message sent`);
-                            }
-                        } catch (saveError) {
-                            console.error(`❌ ${num}: Error saving session:`, saveError);
-                        }
-                        
-                        // Clean up local files after 10 seconds
-                        setTimeout(() => {
-                            removeFile(dirs);
-                            activeSessions.delete(num);
-                        }, 10000);
-                    }
-                    
-                    if (isNewLogin) {
-                        console.log(`🔐 ${num}: New login via pair code`);
-                    }
-                    
-                    if (isOnline) {
-                        console.log(`📶 ${num}: Client is online`);
-                    }
-                    
-                    if (connection === "close") {
-                        const statusCode = lastDisconnect?.error?.output?.statusCode;
-                        
-                        console.log(`🔌 ${num}: Connection closed (Status: ${statusCode})`);
-                        
-                        // Don't update status if it's just normal closure after pairing
-                        if (statusCode !== 401) {
-                            await sessionDB.updateStatus(num, 'inactive');
-                        }
-                        
-                        // Clean up
-                        removeFile(dirs);
-                        activeSessions.delete(num);
-                    }
-                });
-                
-                // Request pairing code if not registered
-                if (!knightBot.authState.creds.registered) {
-                    await delay(3000);
-                    
+
+            KnightBot.ev.on("connection.update", async (update) => {
+                const { connection, lastDisconnect, isNewLogin, isOnline } =
+                    update;
+
+                if (connection === "open") {
+                    console.log("✅ Connected successfully!");
+                    console.log("📱 Saving session to MongoDB...");
+
                     try {
-                        let code = await knightBot.requestPairingCode(num);
-                        code = code?.match(/.{1,4}/g)?.join("-") || code;
-                        
-                        if (!responseSent) {
-                            responseSent = true;
+                        // Read credentials from file
+                        const credsPath = dirs + "/creds.json";
+                        if (fs.existsSync(credsPath)) {
+                            const credentials = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
                             
-                            res.send({
-                                success: true,
+                            // Save to MongoDB
+                            await sessionDB.saveSession({
                                 phoneNumber: num,
-                                pairingCode: code,
-                                message: "Use this pairing code in your WhatsApp app",
-                                instructions: [
-                                    "1. Open WhatsApp on your phone",
-                                    "2. Go to Settings → Linked Devices",
-                                    '3. Tap "Link a Device"',
-                                    "4. Enter this code: " + code,
-                                    "5. Wait for connection confirmation (this may take 30-60 seconds)",
-                                    "6. You'll receive a confirmation message once connected"
-                                ],
-                                note: "Keep this page open while connecting. Do not refresh!"
+                                sessionType: 'pair',
+                                credentials: credentials,
+                                deviceInfo: {
+                                    platform: 'web',
+                                    browser: 'Chrome',
+                                    userAgent: req.headers['user-agent'] || 'Unknown'
+                                }
                             });
                             
-                            console.log(`📟 ${num}: Pairing code generated: ${code}`);
-                            
-                            // Keep connection alive for 5 minutes to allow WhatsApp to connect
-                            setTimeout(() => {
-                                if (knightBot && knightBot.user) {
-                                    console.log(`⏰ ${num}: Keeping connection alive for pairing...`);
-                                }
-                            }, 30000);
+                            console.log("✅ Session saved to MongoDB");
+
+                            // Send MEGA file ID equivalent (now using MongoDB ID)
+                            const userJid = jidNormalizedUser(
+                                num + "@s.whatsapp.net",
+                            );
+
+                            await KnightBot.sendMessage(userJid, {
+                                text: `✅ Session saved to database!\n\nYour session ID: ${num}\n\nYou can now use this session with your WhatsApp bot.`,
+                            });
+                            console.log("📄 Session saved notification sent");
                         }
                     } catch (error) {
-                        console.error(`❌ ${num}: Error requesting pairing code:`, error);
-                        
-                        if (!responseSent) {
-                            responseSent = true;
-                            res.status(503).send({
-                                success: false,
-                                message: "Failed to get pairing code. Please check your phone number and try again."
-                            });
-                        }
-                        
+                        console.error("❌ Error saving to MongoDB:", error);
+                        // Don't crash if MongoDB save fails - just log it
+                    }
+                    
+                    // Clean up local files after a delay
+                    setTimeout(() => {
                         removeFile(dirs);
-                        activeSessions.delete(num);
+                    }, 5000);
+                }
+
+                if (isNewLogin) {
+                    console.log("🔐 New login via pair code");
+                }
+
+                if (isOnline) {
+                    console.log("📶 Client is online");
+                }
+
+                if (connection === "close") {
+                    const statusCode =
+                        lastDisconnect?.error?.output?.statusCode;
+
+                    if (statusCode === 401) {
+                        console.log(
+                            "❌ Logged out from WhatsApp. Need to generate new pair code.",
+                        );
+                    } else {
+                        console.log("🔁 Connection closed — restarting...");
+                        initiateSession();
                     }
                 }
-                
-                knightBot.ev.on("creds.update", saveCreds);
-                
-            } catch (err) {
-                console.error(`❌ ${num}: Error initializing session:`, err);
-                
-                if (!responseSent) {
-                    responseSent = true;
-                    res.status(500).send({
-                        success: false,
-                        message: "Service Unavailable. Please try again later."
-                    });
-                }
-                
-                removeFile(dirs);
-                activeSessions.delete(num);
-            }
-        }
-        
-        // Start session initiation
-        await initiateSession();
-        
-    } catch (error) {
-        console.error("❌ Pair route error:", error);
-        
-        if (!res.headersSent) {
-            res.status(500).send({
-                success: false,
-                message: "Internal server error"
             });
+
+            if (!KnightBot.authState.creds.registered) {
+                await delay(3000); // Wait 3 seconds before requesting pairing code
+                num = num.replace(/[^\d+]/g, "");
+                if (num.startsWith("+")) num = num.substring(1);
+
+                try {
+                    let code = await KnightBot.requestPairingCode(num);
+                    code = code?.match(/.{1,4}/g)?.join("-") || code;
+                    if (!res.headersSent) {
+                        console.log({ num, code });
+                        await res.send({ code });
+                    }
+                } catch (error) {
+                    console.error("Error requesting pairing code:", error);
+                    if (!res.headersSent) {
+                        res.status(503).send({
+                            code: "Failed to get pairing code. Please check your phone number and try again.",
+                        });
+                    }
+                    setTimeout(() => process.exit(1), 2000);
+                }
+            }
+
+            KnightBot.ev.on("creds.update", saveCreds);
+        } catch (err) {
+            console.error("Error initializing session:", err);
+            if (!res.headersSent) {
+                res.status(503).send({ code: "Service Unavailable" });
+            }
+            setTimeout(() => process.exit(1), 2000);
         }
     }
+
+    await initiateSession();
 });
 
-// Keep the process alive
-process.on('uncaughtException', (err) => {
+process.on("uncaughtException", (err) => {
     let e = String(err);
     if (e.includes("conflict")) return;
     if (e.includes("not-authorized")) return;
@@ -279,6 +193,7 @@ process.on('uncaughtException', (err) => {
         return;
     if (e.includes("statusCode: 515") || e.includes("statusCode: 503")) return;
     console.log("Caught exception: ", err);
+    process.exit(1);
 });
 
 export default router;
