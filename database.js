@@ -62,7 +62,7 @@ export async function connectDB() {
         // MongoDB Atlas connection string
         const mongoURI =
             process.env.MONGODB_URI ||
-            "mongodb+srv://whatsappBotUser:AdanuwamdWhatsAppBot^21865@mybot.7iuajoj.mongodb.net/?appName=MyBot";
+            "mongodb+srv://whatsappBotUser:AdanuwamdWhatsAppBot%5E21865@mybot.7iuajoj.mongodb.net/?appName=MyBot";
 
         console.log("🔌 Connecting to MongoDB...");
 
