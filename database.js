@@ -53,8 +53,7 @@ const SessionSchema = new mongoose.Schema({
 SessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 // Create model
-export const Session =
-    mongoose.models.Session || mongoose.model("Session", SessionSchema);
+export const Session = mongoose.models.Session || mongoose.model('Session', SessionSchema, 'sessions');
 
 // UPDATED Connection function for Mongoose 7+
 export async function connectDB() {
@@ -62,7 +61,7 @@ export async function connectDB() {
         // MongoDB Atlas connection string
         const mongoURI =
             process.env.MONGODB_URI ||
-            "mongodb+srv://whatsappBotUser:AdanuwamdWhatsAppBot%5E21865@mybot.7iuajoj.mongodb.net/?appName=MyBot";
+            "mongodb+srv://whatsappBotUser:AdanuwamdWhatsAppBot%5E21865@mybot.7iuajoj.mongodb.net/MyBot?retryWrites=true&w=majority";
 
         console.log("🔌 Connecting to MongoDB...");
 
