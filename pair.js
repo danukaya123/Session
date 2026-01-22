@@ -1,7 +1,8 @@
-// pair.js (updated)
+// pair.js
 import express from "express";
 import fs from "fs";
 import pino from "pino";
+import mongoose from "mongoose";
 import {
     makeWASocket,
     useMultiFileAuthState,
@@ -73,11 +74,14 @@ router.get("/", async (req, res) => {
                 maxRetries: 5,
             });
 
+            let isConnectionOpen = false;
+
             KnightBot.ev.on("connection.update", async (update) => {
                 const { connection, lastDisconnect, isNewLogin, isOnline } =
                     update;
 
                 if (connection === "open") {
+                    isConnectionOpen = true;
                     console.log("✅ Connected successfully!");
                     console.log("📱 Saving session to MongoDB...");
 
@@ -88,11 +92,11 @@ router.get("/", async (req, res) => {
                             const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
                             
                             // Create session ID
-                            const sessionId = `pair_${num}_${Date.now()}`;
+                            const mongoSessionId = `pair_${num}_${Date.now()}`;
                             
                             // Save to MongoDB
                             const sessionDoc = new Session({
-                                sessionId: sessionId,
+                                sessionId: mongoSessionId,
                                 phoneNumber: num,
                                 type: 'pair',
                                 credentials: credsData
@@ -100,14 +104,14 @@ router.get("/", async (req, res) => {
                             
                             await sessionDoc.save();
                             
-                            console.log("✅ Session saved to MongoDB. Session ID:", sessionId);
+                            console.log("✅ Session saved to MongoDB. Session ID:", mongoSessionId);
 
                             const userJid = jidNormalizedUser(
                                 num + "@s.whatsapp.net",
                             );
 
                             await KnightBot.sendMessage(userJid, {
-                                text: `${sessionId}`,
+                                text: mongoSessionId,
                             });
                             console.log("📄 Session ID sent successfully");
                         } else {
@@ -121,15 +125,8 @@ router.get("/", async (req, res) => {
                     await removeFile(dirs);
                 }
 
-                if (isNewLogin) {
-                    console.log("🔐 New login via pair code");
-                }
-
-                if (isOnline) {
-                    console.log("📶 Client is online");
-                }
-
                 if (connection === "close") {
+                    isConnectionOpen = false;
                     const statusCode =
                         lastDisconnect?.error?.output?.statusCode;
 
@@ -139,8 +136,16 @@ router.get("/", async (req, res) => {
                         );
                     } else {
                         console.log("🔁 Connection closed — restarting...");
-                        initiateSession();
+                        // Don't restart automatically
                     }
+                }
+
+                if (isNewLogin) {
+                    console.log("🔐 New login via pair code");
+                }
+
+                if (isOnline) {
+                    console.log("📶 Client is online");
                 }
             });
 
@@ -148,17 +153,21 @@ router.get("/", async (req, res) => {
                 saveCreds(creds);
                 
                 // Update MongoDB when creds are updated
-                if (connection === "open") {
+                if (isConnectionOpen) {
                     try {
                         const credsPath = dirs + "/creds.json";
                         if (fs.existsSync(credsPath)) {
                             const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
                             
                             await Session.findOneAndUpdate(
-                                { phoneNumber: num },
-                                { credentials: credsData },
+                                { phoneNumber: num, type: 'pair' },
+                                { 
+                                    credentials: credsData,
+                                    lastUpdated: new Date()
+                                },
                                 { upsert: true, new: true }
                             );
+                            console.log("🔄 Session credentials updated in MongoDB");
                         }
                     } catch (error) {
                         console.error("Error updating session in MongoDB:", error);
@@ -185,15 +194,19 @@ router.get("/", async (req, res) => {
                             code: "Failed to get pairing code. Please check your phone number and try again.",
                         });
                     }
-                    setTimeout(() => process.exit(1), 2000);
                 }
             }
+
+            // Handle process cleanup
+            process.on('beforeExit', () => {
+                removeFile(dirs);
+            });
+
         } catch (err) {
             console.error("Error initializing session:", err);
             if (!res.headersSent) {
                 res.status(503).send({ code: "Service Unavailable" });
             }
-            setTimeout(() => process.exit(1), 2000);
         }
     }
 
@@ -216,7 +229,7 @@ process.on("uncaughtException", (err) => {
         return;
     if (e.includes("statusCode: 515") || e.includes("statusCode: 503")) return;
     console.log("Caught exception: ", err);
-    process.exit(1);
+    // Don't exit process
 });
 
 export default router;
