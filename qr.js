@@ -1,3 +1,4 @@
+// qr.js (updated)
 import express from "express";
 import fs from "fs";
 import pino from "pino";
@@ -11,7 +12,7 @@ import {
     fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
-import { upload } from "./mega.js";
+import { connectDB, Session } from "./db.js";
 
 const router = express.Router();
 
@@ -24,18 +25,8 @@ function removeFile(FilePath) {
     }
 }
 
-function getMegaFileId(url) {
-    try {
-        const match = url.match(/\/file\/([^#]+#[^\/]+)/);
-        return match ? match[1] : null;
-    } catch (error) {
-        return null;
-    }
-}
-
 router.get("/", async (req, res) => {
-    const sessionId =
-        Date.now().toString() + Math.random().toString(36).substr(2, 9);
+    const sessionId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
     const dirs = `./qr_sessions/session_${sessionId}`;
 
     if (!fs.existsSync("./qr_sessions")) {
@@ -48,6 +39,9 @@ router.get("/", async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
         try {
+            // Connect to MongoDB
+            await connectDB();
+            
             const { version, isLatest } = await fetchLatestBaileysVersion();
 
             let responseSent = false;
@@ -122,41 +116,48 @@ router.get("/", async (req, res) => {
 
                 if (connection === "open") {
                     console.log("✅ Connected successfully!");
-                    console.log("📱 Uploading session to MEGA...");
+                    console.log("📱 Saving session to MongoDB...");
 
                     try {
                         const credsPath = dirs + "/creds.json";
-                        const megaUrl = await upload(
-                            credsPath,
-                            `creds_qr_${sessionId}.json`,
-                        );
-                        const megaFileId = getMegaFileId(megaUrl);
-
-                        if (megaFileId) {
-                            console.log(
-                                "✅ Session uploaded to MEGA. File ID:",
-                                megaFileId,
-                            );
+                        if (fs.existsSync(credsPath)) {
+                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                            const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
+                            
+                            // Save to MongoDB
+                            const sessionDoc = new Session({
+                                sessionId: `qr_${sessionId}`,
+                                phoneNumber: phoneNumber,
+                                type: 'qr',
+                                credentials: credsData
+                            });
+                            
+                            await sessionDoc.save();
+                            
+                            console.log("✅ Session saved to MongoDB. Session ID:", `qr_${sessionId}`);
 
                             const userJid = jidNormalizedUser(
                                 KnightBot.authState.creds.me?.id || "",
                             );
                             if (userJid) {
                                 await KnightBot.sendMessage(userJid, {
-                                    text: `${megaFileId}`,
+                                    text: `qr_${sessionId}`,
                                 });
                                 console.log(
-                                    "📄 MEGA file ID sent successfully",
+                                    "📄 Session ID sent successfully",
                                 );
                             } else {
                                 console.log("❌ Could not determine user JID");
                             }
                         } else {
-                            console.log("❌ Failed to upload to MEGA");
+                            console.log("❌ Creds file not found");
                         }
                     } catch (error) {
-                        console.error("❌ Error uploading to MEGA:", error);
+                        console.error("❌ Error saving to MongoDB:", error);
                     }
+                    
+                    // Clean up local files
+                    await removeFile(dirs);
                 }
 
                 if (isNewLogin) {
@@ -182,7 +183,28 @@ router.get("/", async (req, res) => {
                 }
             });
 
-            KnightBot.ev.on("creds.update", saveCreds);
+            KnightBot.ev.on("creds.update", async (creds) => {
+                saveCreds(creds);
+                
+                // Update MongoDB when creds are updated
+                if (connection === "open") {
+                    try {
+                        const credsPath = dirs + "/creds.json";
+                        if (fs.existsSync(credsPath)) {
+                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                            const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
+                            
+                            await Session.findOneAndUpdate(
+                                { sessionId: `qr_${sessionId}` },
+                                { credentials: credsData, phoneNumber: phoneNumber },
+                                { upsert: true, new: true }
+                            );
+                        }
+                    } catch (error) {
+                        console.error("Error updating session in MongoDB:", error);
+                    }
+                }
+            });
 
             setTimeout(() => {
                 if (!responseSent) {
