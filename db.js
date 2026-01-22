@@ -35,16 +35,16 @@ const sessionFileSchema = new mongoose.Schema({
         required: true
     },
     filePath: {
-        type: String, // Virtual path like "sessions/94771234567/creds.json"
+        type: String,
         required: true
     },
     fileData: {
-        type: Buffer, // Store the actual file content as Buffer
+        type: Buffer,
         required: true
     },
     fileType: {
         type: String,
-        enum: ['creds', 'auth', 'config'],
+        enum: ['creds', 'auth', 'config', 'other'],
         default: 'creds'
     },
     sessionType: {
@@ -52,16 +52,24 @@ const sessionFileSchema = new mongoose.Schema({
         enum: ['pair', 'qr'],
         default: 'pair'
     },
+    version: {
+        type: Number,
+        default: 1
+    },
     createdAt: {
         type: Date,
         default: Date.now,
         expires: 2592000 // Auto delete after 30 days
+    },
+    updatedAt: {
+        type: Date,
+        default: Date.now
     }
 });
 
-// Index for faster queries
-sessionFileSchema.index({ phoneNumber: 1, fileName: 1 }, { unique: true });
-sessionFileSchema.index({ filePath: 1 }, { unique: true });
+// Remove the unique constraint and make it compound index without unique
+sessionFileSchema.index({ phoneNumber: 1, fileName: 1 });
+sessionFileSchema.index({ filePath: 1 });
 
 export const SessionFile = mongoose.model('SessionFile', sessionFileSchema, 'session_files');
 
@@ -84,31 +92,55 @@ const sessionMetaSchema = new mongoose.Schema({
     },
     status: {
         type: String,
-        enum: ['active', 'inactive'],
+        enum: ['active', 'inactive', 'expired'],
         default: 'active'
+    },
+    version: {
+        type: Number,
+        default: 1
     },
     files: [{
         fileName: String,
         filePath: String,
-        fileType: String
+        fileType: String,
+        version: Number
     }],
     createdAt: {
         type: Date,
         default: Date.now
     },
-    lastUsed: {
+    updatedAt: {
         type: Date,
         default: Date.now
     }
 });
 
+sessionMetaSchema.index({ phoneNumber: 1, status: 1 });
+
 export const SessionMeta = mongoose.model('SessionMeta', sessionMetaSchema, 'session_metadata');
 
-// Function to save session folder to MongoDB
+// Function to save or update session folder
 export async function saveSessionFolder(phoneNumber, sessionType, localFolderPath) {
     try {
-        const files = [];
         const sessionId = `${sessionType}_${phoneNumber}_${Date.now()}`;
+        const files = [];
+        
+        // First, check if session exists for this phone number
+        const existingSession = await SessionMeta.findOne({ 
+            phoneNumber, 
+            status: 'active',
+            type: sessionType 
+        });
+        
+        let version = 1;
+        if (existingSession) {
+            version = existingSession.version + 1;
+            console.log(`🔄 Updating existing session v${existingSession.version} to v${version}`);
+            
+            // Mark old session as inactive
+            existingSession.status = 'inactive';
+            await existingSession.save();
+        }
         
         // Read all files in the session folder
         const fileNames = fs.readdirSync(localFolderPath);
@@ -127,48 +159,69 @@ export async function saveSessionFolder(phoneNumber, sessionType, localFolderPat
                 else if (fileName.includes('auth')) fileType = 'auth';
                 else if (fileName.includes('config')) fileType = 'config';
                 
-                // Create virtual path
-                const virtualPath = `sessions/${phoneNumber}/${fileName}`;
+                // Create unique file path with version
+                const uniqueFileName = `${version}_${fileName}`;
+                const virtualPath = `sessions/${phoneNumber}/v${version}/${fileName}`;
                 
-                // Save file to MongoDB
-                const sessionFile = new SessionFile({
+                // Check if file already exists for this version
+                const existingFile = await SessionFile.findOne({
                     phoneNumber,
-                    fileName,
-                    filePath: virtualPath,
-                    fileData,
-                    fileType,
-                    sessionType
+                    fileName: uniqueFileName
                 });
                 
-                await sessionFile.save();
+                if (existingFile) {
+                    // Update existing file
+                    existingFile.fileData = fileData;
+                    existingFile.filePath = virtualPath;
+                    existingFile.updatedAt = new Date();
+                    await existingFile.save();
+                    console.log(`📁 Updated file: ${fileName} (v${version})`);
+                } else {
+                    // Create new file with versioned name
+                    const sessionFile = new SessionFile({
+                        phoneNumber,
+                        fileName: uniqueFileName, // Store with version prefix
+                        filePath: virtualPath,
+                        fileData,
+                        fileType,
+                        sessionType,
+                        version
+                    });
+                    
+                    await sessionFile.save();
+                    console.log(`📁 Saved new file: ${fileName} (v${version})`);
+                }
                 
                 files.push({
                     fileName,
                     filePath: virtualPath,
-                    fileType
+                    fileType,
+                    version
                 });
-                
-                console.log(`📁 Saved file: ${fileName} for ${phoneNumber}`);
             }
         }
         
-        // Save session metadata
+        // Save or update session metadata
         const sessionMeta = new SessionMeta({
             sessionId,
             phoneNumber,
             type: sessionType,
             status: 'active',
-            files
+            version,
+            files,
+            updatedAt: new Date()
         });
         
         await sessionMeta.save();
         
-        console.log(`✅ Saved session folder for ${phoneNumber} with ${files.length} files`);
+        console.log(`✅ Saved session for ${phoneNumber} with ${files.length} files`);
         console.log(`📋 Session ID: ${sessionId}`);
+        console.log(`🔢 Version: v${version}`);
         
         return {
             sessionId,
             phoneNumber,
+            version,
             filesCount: files.length,
             files
         };
@@ -179,23 +232,38 @@ export async function saveSessionFolder(phoneNumber, sessionType, localFolderPat
     }
 }
 
-// Function to get session by phone number
-export async function getSessionFiles(phoneNumber) {
-    return await SessionFile.find({ phoneNumber });
+// Function to get latest active session for a phone number
+export async function getLatestSession(phoneNumber, sessionType = null) {
+    const query = { 
+        phoneNumber, 
+        status: 'active' 
+    };
+    
+    if (sessionType) {
+        query.type = sessionType;
+    }
+    
+    return await SessionMeta.findOne(query).sort({ version: -1 });
 }
 
-// Function to get session metadata
-export async function getSessionMeta(phoneNumber) {
-    return await SessionMeta.findOne({ phoneNumber, status: 'active' });
+// Function to get session files by version
+export async function getSessionFilesByVersion(phoneNumber, version) {
+    return await SessionFile.find({ 
+        phoneNumber, 
+        version 
+    });
 }
 
 // Function to restore session to local folder
-export async function restoreSessionFolder(phoneNumber, outputPath) {
+export async function restoreSessionToFolder(phoneNumber, version, outputPath) {
     try {
-        const files = await SessionFile.find({ phoneNumber });
+        const files = await SessionFile.find({ 
+            phoneNumber, 
+            version 
+        });
         
         if (files.length === 0) {
-            throw new Error(`No session files found for ${phoneNumber}`);
+            throw new Error(`No session files found for ${phoneNumber} v${version}`);
         }
         
         // Create output directory
@@ -203,24 +271,60 @@ export async function restoreSessionFolder(phoneNumber, outputPath) {
             fs.mkdirSync(outputPath, { recursive: true });
         }
         
-        // Restore each file
+        // Restore each file (remove version prefix from filename)
         for (const file of files) {
-            const fileOutputPath = path.join(outputPath, file.fileName);
+            // Extract original filename (remove "1_" prefix)
+            const originalFileName = file.fileName.replace(/^\d+_/, '');
+            const fileOutputPath = path.join(outputPath, originalFileName);
             fs.writeFileSync(fileOutputPath, file.fileData);
-            console.log(`📁 Restored: ${file.fileName}`);
+            console.log(`📁 Restored: ${originalFileName}`);
         }
         
         // Update last used time
         await SessionMeta.updateOne(
-            { phoneNumber, status: 'active' },
-            { lastUsed: new Date() }
+            { phoneNumber, version, status: 'active' },
+            { updatedAt: new Date() }
         );
         
-        console.log(`✅ Restored session for ${phoneNumber} to ${outputPath}`);
-        return { success: true, filesCount: files.length };
+        console.log(`✅ Restored session v${version} for ${phoneNumber} to ${outputPath}`);
+        return { success: true, filesCount: files.length, version };
         
     } catch (error) {
         console.error('❌ Error restoring session:', error);
+        throw error;
+    }
+}
+
+// Function to delete old sessions
+export async function cleanupOldSessions(phoneNumber, keepVersions = 3) {
+    try {
+        // Get all sessions ordered by version
+        const allSessions = await SessionMeta.find({ phoneNumber })
+            .sort({ version: -1 });
+        
+        if (allSessions.length > keepVersions) {
+            const sessionsToDelete = allSessions.slice(keepVersions);
+            
+            for (const session of sessionsToDelete) {
+                // Delete session files
+                await SessionFile.deleteMany({ 
+                    phoneNumber, 
+                    version: session.version 
+                });
+                
+                // Delete session metadata
+                await SessionMeta.deleteOne({ _id: session._id });
+                
+                console.log(`🗑️  Deleted old session v${session.version}`);
+            }
+            
+            return { deleted: sessionsToDelete.length };
+        }
+        
+        return { deleted: 0 };
+        
+    } catch (error) {
+        console.error('❌ Error cleaning up old sessions:', error);
         throw error;
     }
 }
@@ -244,7 +348,8 @@ export default {
     SessionFile,
     SessionMeta,
     saveSessionFolder,
-    getSessionFiles,
-    getSessionMeta,
-    restoreSessionFolder
+    getLatestSession,
+    getSessionFilesByVersion,
+    restoreSessionToFolder,
+    cleanupOldSessions
 };
