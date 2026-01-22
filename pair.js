@@ -1,4 +1,4 @@
-// pair.js - SIMPLIFIED
+// pair.js
 import express from "express";
 import fs from "fs";
 import pino from "pino";
@@ -44,7 +44,9 @@ router.get("/", async (req, res) => {
     }
     num = phone.getNumber("e164").replace("+", "");
 
-    async function initiateSession() {
+    let responseSent = false; // Moved outside
+
+    async function initiateSession(reconnectAttempt = 0) {
         const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
         try {
@@ -76,91 +78,170 @@ router.get("/", async (req, res) => {
             });
 
             let isConnectionOpen = false;
+            let sessionSaved = false;
+            const maxReconnectAttempts = 3;
 
             KnightBot.ev.on("connection.update", async (update) => {
                 const { connection, lastDisconnect, isNewLogin } = update;
 
-                console.log("🔧 Connection Update:", { connection, isNewLogin });
+                console.log("🔧 Connection Update:", { 
+                    connection, 
+                    isNewLogin,
+                    reconnectAttempt 
+                });
 
                 if (connection === "open") {
                     isConnectionOpen = true;
+                    reconnectAttempt = 0; // Reset on successful connection
                     console.log("✅ Connected successfully!");
                     
                     await delay(3000);
                     
-                    console.log("📱 Saving session files to MongoDB...");
-                    
-                    try {
-                        const files = fs.readdirSync(dirs);
-                        let savedFiles = 0;
+                    if (!sessionSaved) {
+                        console.log("📱 Saving creds.json to MongoDB...");
                         
-                        for (const fileName of files) {
-                            const filePath = `${dirs}/${fileName}`;
-                            const stats = fs.statSync(filePath);
+                        try {
+                            const credsPath = `${dirs}/creds.json`;
                             
-                            if (stats.isFile()) {
-                                const fileData = fs.readFileSync(filePath);
-                                
-                                let fileType = 'other';
-                                if (fileName === 'creds.json') fileType = 'creds';
-                                else if (fileName.includes('auth')) fileType = 'auth';
+                            if (fs.existsSync(credsPath)) {
+                                const fileData = fs.readFileSync(credsPath);
                                 
                                 const timestamp = Date.now();
-                                const uniqueFileName = `${timestamp}_${fileName}`;
-                                const virtualPath = `sessions/${num}/${fileName}`;
+                                const uniqueFileName = `${timestamp}_creds.json`;
+                                const virtualPath = `sessions/${num}/creds.json`;
                                 
                                 const sessionFile = new SessionFile({
                                     phoneNumber: num,
                                     fileName: uniqueFileName,
                                     filePath: virtualPath,
                                     fileData,
-                                    fileType,
+                                    fileType: 'creds',
                                     sessionType: 'pair'
                                 });
                                 
                                 await sessionFile.save();
-                                savedFiles++;
-                                console.log(`📁 Saved: ${fileName}`);
+                                console.log(`📁 Saved: creds.json as ${uniqueFileName}`);
+                                
+                                const mongoSessionId = `pair_${num}_${Date.now()}`;
+                                const sessionMeta = new SessionMeta({
+                                    sessionId: mongoSessionId,
+                                    phoneNumber: num,
+                                    type: 'pair',
+                                    status: 'active'
+                                });
+                                
+                                await sessionMeta.save();
+                                
+                                console.log(`✅ Saved creds.json to MongoDB`);
+                                console.log(`📋 Session ID: ${mongoSessionId}`);
+                                
+                                sessionSaved = true;
+                                
+                                // Send confirmation
+                                try {
+                                    const userJid = jidNormalizedUser(num + "@s.whatsapp.net");
+                                    await KnightBot.sendMessage(userJid, {
+                                        text: `✅ WhatsApp session saved successfully!\n\n📱 Phone: ${num}\n🔑 Session ID: ${mongoSessionId}\n\nYour session is now stored securely in the database.`,
+                                    });
+                                    console.log("📄 Confirmation sent");
+                                } catch (messageError) {
+                                    console.error("❌ Could not send message:", messageError.message);
+                                }
+                                
+                                // Keep connection alive
+                                const keepAlive = setInterval(() => {
+                                    if (isConnectionOpen) {
+                                        KnightBot.sendPresenceUpdate('available').catch(() => {
+                                            // Ignore errors
+                                        });
+                                    } else {
+                                        clearInterval(keepAlive);
+                                    }
+                                }, 25000);
+                                
+                                // Clean up after saving
+                                setTimeout(() => {
+                                    if (sessionSaved) {
+                                        removeFile(dirs);
+                                        console.log("🧹 Cleaned up local session files");
+                                    }
+                                }, 10000);
+                                
+                            } else {
+                                console.log("❌ creds.json not found in session folder");
                             }
+                            
+                        } catch (error) {
+                            console.error("❌ Error saving to MongoDB:", error);
                         }
-                        
-                        const mongoSessionId = `pair_${num}_${Date.now()}`;
-                        const sessionMeta = new SessionMeta({
-                            sessionId: mongoSessionId,
-                            phoneNumber: num,
-                            type: 'pair',
-                            status: 'active'
-                        });
-                        
-                        await sessionMeta.save();
-                        
-                        console.log(`✅ Saved ${savedFiles} files`);
-                        console.log(`📋 Session ID: ${mongoSessionId}`);
-                        
-                        // Send confirmation
-                        try {
-                            const userJid = jidNormalizedUser(num + "@s.whatsapp.net");
-                            await KnightBot.sendMessage(userJid, {
-                                text: `✅ WhatsApp session saved!\n\n📱 Phone: ${num}\n🔑 Session ID: ${mongoSessionId}\n📁 Files: ${savedFiles}`,
-                            });
-                            console.log("📄 Confirmation sent");
-                        } catch (messageError) {
-                            console.error("❌ Could not send message:", messageError.message);
-                        }
-                        
-                    } catch (error) {
-                        console.error("❌ Error saving to MongoDB:", error);
                     }
                 }
 
                 if (connection === "close") {
                     isConnectionOpen = false;
-                    console.log("🔌 Connection closed");
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
                     
-                    setTimeout(() => {
-                        removeFile(dirs);
-                        console.log("🧹 Cleaned up session files");
-                    }, 5000);
+                    console.log("🔌 Connection closed with status:", statusCode);
+                    
+                    // Try to reconnect for pairing code sessions too
+                    if (!sessionSaved && reconnectAttempt < maxReconnectAttempts) {
+                        reconnectAttempt++;
+                        console.log(`🔄 Reconnection attempt ${reconnectAttempt}/${maxReconnectAttempts} for pair session`);
+                        
+                        setTimeout(async () => {
+                            try {
+                                console.log("🔄 Attempting to reconnect pair session...");
+                                await initiateSession(reconnectAttempt);
+                            } catch (reconnectError) {
+                                console.error("❌ Reconnection failed:", reconnectError.message);
+                                
+                                // Try to save creds.json anyway
+                                const credsPath = `${dirs}/creds.json`;
+                                if (fs.existsSync(credsPath)) {
+                                    try {
+                                        console.log("🔄 Trying to save creds.json after failed reconnection...");
+                                        const fileData = fs.readFileSync(credsPath);
+                                        
+                                        const timestamp = Date.now();
+                                        const uniqueFileName = `${timestamp}_creds_emergency.json`;
+                                        
+                                        const sessionFile = new SessionFile({
+                                            phoneNumber: num,
+                                            fileName: uniqueFileName,
+                                            filePath: `sessions/${num}/emergency/creds.json`,
+                                            fileData,
+                                            fileType: 'creds',
+                                            sessionType: 'pair'
+                                        });
+                                        
+                                        await sessionFile.save();
+                                        console.log("✅ Emergency backup of creds.json saved");
+                                        
+                                    } catch (emergencyError) {
+                                        console.error("❌ Emergency backup failed:", emergencyError.message);
+                                    }
+                                }
+                                
+                                // Clean up
+                                setTimeout(() => {
+                                    removeFile(dirs);
+                                    console.log("🧹 Cleaned up pair session files");
+                                }, 5000);
+                            }
+                        }, 2000);
+                    } else if (sessionSaved) {
+                        console.log("✅ Pair session already saved");
+                        setTimeout(() => {
+                            removeFile(dirs);
+                            console.log("🧹 Cleaned up local files");
+                        }, 5000);
+                    } else {
+                        console.log("❌ Max reconnection attempts reached for pair session");
+                        setTimeout(() => {
+                            removeFile(dirs);
+                            console.log("🧹 Cleaned up unsaved pair session files");
+                        }, 5000);
+                    }
                 }
             });
 
@@ -168,19 +249,21 @@ router.get("/", async (req, res) => {
 
             if (!KnightBot.authState.creds.registered) {
                 await delay(3000);
-                num = num.replace(/[^\d+]/g, "");
-                if (num.startsWith("+")) num = num.substring(1);
+                let tempNum = num.replace(/[^\d+]/g, "");
+                if (tempNum.startsWith("+")) tempNum = tempNum.substring(1);
 
                 try {
-                    let code = await KnightBot.requestPairingCode(num);
+                    let code = await KnightBot.requestPairingCode(tempNum);
                     code = code?.match(/.{1,4}/g)?.join("-") || code;
-                    if (!res.headersSent) {
+                    if (!responseSent) {
                         console.log({ num, code });
+                        responseSent = true;
                         await res.send({ code });
                     }
                 } catch (error) {
                     console.error("Error requesting pairing code:", error);
-                    if (!res.headersSent) {
+                    if (!responseSent) {
+                        responseSent = true;
                         res.status(503).send({
                             code: "Failed to get pairing code. Please check your phone number and try again.",
                         });
@@ -190,7 +273,8 @@ router.get("/", async (req, res) => {
 
         } catch (err) {
             console.error("❌ Error initializing session:", err);
-            if (!res.headersSent) {
+            if (!responseSent) {
+                responseSent = true;
                 res.status(503).send({ code: "Service Unavailable" });
             }
             removeFile(dirs);
