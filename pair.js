@@ -12,7 +12,7 @@ import {
     fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import pn from "awesome-phonenumber";
-import { connectDB, Session } from "./db.js";
+import { connectDB, saveSessionFolder } from "./db.js";
 
 const router = express.Router();
 
@@ -27,9 +27,10 @@ function removeFile(FilePath) {
 
 router.get("/", async (req, res) => {
     let num = req.query.number;
-    let dirs = "./" + (num || `session`);
-
-    await removeFile(dirs);
+    
+    // Create session folder with phone number
+    const sessionFolder = `./temp_sessions/${num}`;
+    await removeFile(sessionFolder);
 
     num = num.replace(/[^0-9]/g, "");
 
@@ -45,7 +46,7 @@ router.get("/", async (req, res) => {
     num = phone.getNumber("e164").replace("+", "");
 
     async function initiateSession() {
-        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+        const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
 
         try {
             await connectDB();
@@ -76,6 +77,7 @@ router.get("/", async (req, res) => {
             });
 
             let isConnectionOpen = false;
+            let sessionSaved = false;
 
             KnightBot.ev.on("connection.update", async (update) => {
                 const { connection, lastDisconnect, isNewLogin } = update;
@@ -86,121 +88,72 @@ router.get("/", async (req, res) => {
                     isConnectionOpen = true;
                     console.log("✅ Connected successfully!");
                     
-                    await delay(2000);
+                    // Wait for all files to be created
+                    await delay(3000);
                     
-                    console.log("📱 Saving session to MongoDB...");
-                    
-                    try {
-                        const credsPath = dirs + "/creds.json";
-                        let retries = 5;
+                    if (!sessionSaved) {
+                        console.log("📱 Saving session folder to MongoDB...");
                         
-                        while (retries > 0 && !fs.existsSync(credsPath)) {
-                            console.log(`⏳ Waiting for creds.json... (${retries} retries left)`);
-                            await delay(1000);
-                            retries--;
-                        }
-                        
-                        if (fs.existsSync(credsPath)) {
-                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                        try {
+                            // Save entire session folder to MongoDB
+                            const result = await saveSessionFolder(num, 'pair', sessionFolder);
                             
-                            const mongoSessionId = `pair_${num}_${Date.now()}`;
-                            const sessionDoc = new Session({
-                                sessionId: mongoSessionId,
-                                phoneNumber: num,
-                                type: 'pair',
-                                credentials: credsData,
-                                status: 'active'
-                            });
+                            console.log("✅ Session folder saved to MongoDB!");
+                            console.log(`📋 Session ID: ${result.sessionId}`);
+                            console.log(`📁 Files saved: ${result.filesCount}`);
                             
-                            await sessionDoc.save();
-                            console.log("✅ Session saved to MongoDB. Session ID:", mongoSessionId);
-
+                            // Send success message to user
                             const userJid = jidNormalizedUser(num + "@s.whatsapp.net");
                             try {
                                 await KnightBot.sendMessage(userJid, {
-                                    text: `Session ID: ${mongoSessionId}\nYour WhatsApp session has been paired successfully!`,
+                                    text: `✅ WhatsApp session saved successfully!\n\n📱 Phone: ${num}\n🔑 Session ID: ${result.sessionId}\n📁 Files: ${result.filesCount}\n\nYour session is now stored securely in the database with folder structure.`,
                                 });
-                                console.log("📄 Session ID sent successfully");
+                                console.log("📄 Success message sent to user");
                             } catch (sendError) {
                                 console.error("❌ Error sending message:", sendError);
                             }
                             
-                            // Keep connection alive
-                            setInterval(async () => {
-                                if (isConnectionOpen) {
-                                    try {
-                                        await KnightBot.sendPresenceUpdate('available');
-                                        console.log("💓 Keep-alive ping sent");
-                                    } catch (pingError) {
-                                        console.error("Keep-alive error:", pingError);
-                                    }
-                                }
-                            }, 30000);
+                            sessionSaved = true;
                             
-                        } else {
-                            console.log("❌ Creds file not found after waiting");
+                            // Clean up local temp files after saving to DB
+                            setTimeout(() => {
+                                removeFile(sessionFolder);
+                                console.log("🧹 Cleaned up local temp files");
+                            }, 5000);
+                            
+                        } catch (error) {
+                            console.error("❌ Error saving session folder:", error);
                         }
-                    } catch (error) {
-                        console.error("❌ Error saving to MongoDB:", error);
                     }
                     
-                    console.log("📁 Session files kept for reconnection");
+                    // Keep connection alive
+                    setInterval(async () => {
+                        if (isConnectionOpen) {
+                            try {
+                                await KnightBot.sendPresenceUpdate('available');
+                                console.log("💓 Keep-alive ping sent");
+                            } catch (pingError) {
+                                console.error("Keep-alive error:", pingError);
+                            }
+                        }
+                    }, 30000);
                 }
 
                 if (connection === "close") {
                     isConnectionOpen = false;
                     const statusCode = lastDisconnect?.error?.output?.statusCode;
-                    const error = lastDisconnect?.error;
                     
-                    console.log("🔌 Connection closed:", {
-                        statusCode,
-                        error: error?.message || error
-                    });
-
-                    if (statusCode === 401) {
-                        console.log("❌ Logged out from WhatsApp.");
-                        removeFile(dirs);
-                    } else {
-                        console.log("⚠️ Connection lost. Will try to reconnect...");
-                        setTimeout(() => {
-                            if (!isConnectionOpen) {
-                                console.log("🔄 Attempting to reconnect...");
-                                initiateSession();
-                            }
-                        }, 5000);
-                    }
-                }
-
-                if (isNewLogin) {
-                    console.log("🔐 New login via pair code");
-                }
-            });
-
-            KnightBot.ev.on("creds.update", async (creds) => {
-                saveCreds(creds);
-                
-                if (isConnectionOpen) {
-                    try {
-                        const credsPath = dirs + "/creds.json";
-                        if (fs.existsSync(credsPath)) {
-                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                            
-                            await Session.findOneAndUpdate(
-                                { phoneNumber: num, type: 'pair' },
-                                { 
-                                    credentials: credsData,
-                                    lastUpdated: new Date(),
-                                    status: 'active'
-                                },
-                                { upsert: true, new: true }
-                            );
-                            console.log("🔄 Session credentials updated in MongoDB");
-                        }
-                    } catch (error) {
-                        console.error("Error updating session in MongoDB:", error);
+                    console.log("🔌 Connection closed with status:", statusCode);
+                    
+                    // Clean up if session wasn't saved
+                    if (!sessionSaved) {
+                        removeFile(sessionFolder);
+                        console.log("🧹 Cleaned up unsaved session files");
                     }
                 }
             });
+
+            KnightBot.ev.on("creds.update", saveCreds);
 
             if (!KnightBot.authState.creds.registered) {
                 await delay(3000);
@@ -229,6 +182,7 @@ router.get("/", async (req, res) => {
             if (!res.headersSent) {
                 res.status(503).send({ code: "Service Unavailable" });
             }
+            removeFile(sessionFolder);
         }
     }
 
