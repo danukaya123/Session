@@ -1,4 +1,6 @@
 // index.js (updated)
+import dotenv from "dotenv";
+dotenv.config();
 import express from "express";
 import bodyParser from "body-parser";
 import { fileURLToPath } from "url";
@@ -7,8 +9,6 @@ import path from "path";
 import pairRouter from "./pair.js";
 import qrRouter from "./qr.js";
 import { connectDB } from "./db.js";
-import dotenv from 'dotenv';
-dotenv.config();
 
 
 const app = express();
