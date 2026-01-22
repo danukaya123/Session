@@ -1,4 +1,4 @@
-
+// index.js (updated)
 import express from "express";
 import bodyParser from "body-parser";
 import { fileURLToPath } from "url";
@@ -6,6 +6,7 @@ import path from "path";
 
 import pairRouter from "./pair.js";
 import qrRouter from "./qr.js";
+import { connectDB } from "./db.js";
 
 const app = express();
 
@@ -21,6 +22,9 @@ import("events").then((events) => {
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(__dirname));
+
+// Initialize MongoDB connection
+connectDB().catch(console.error);
 
 app.get("/", (req, res) => {
     res.sendFile(path.join(__dirname, "pair.html"));
