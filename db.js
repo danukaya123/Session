@@ -1,7 +1,7 @@
 // db.js
 import mongoose from 'mongoose';
 
-const MONGODB_URI = 'mongodb+srv://whatsappBotUser:AdanuwamdWhatsAppBot%5E21865@mybot.7iuajoj.mongodb.net/MyBot?retryWrites=true&w=majority';
+const MONGODB_URI = 'mongodb+srv://whatsappBotUser:IuAwNhOpza2YgrHo@mybot.7iuajoj.mongodb.net/MyBot?retryWrites=true&w=majority';
 
 let isConnected = false;
 
