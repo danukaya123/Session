@@ -1,4 +1,4 @@
-// qr.js
+// qr.js - SIMPLIFIED WORKING VERSION
 import express from "express";
 import fs from "fs";
 import pino from "pino";
@@ -12,7 +12,7 @@ import {
     fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
-import { connectDB, saveSessionFolder } from "./db.js";
+import { connectDB, SessionFile, SessionMeta } from "./db.js";
 
 const router = express.Router();
 
@@ -27,16 +27,16 @@ function removeFile(FilePath) {
 
 router.get("/", async (req, res) => {
     const sessionId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
-    const sessionFolder = `./temp_sessions/qr_${sessionId}`;
+    const dirs = `./qr_sessions/session_${sessionId}`;
 
-    if (!fs.existsSync("./temp_sessions")) {
-        fs.mkdirSync("./temp_sessions", { recursive: true });
+    if (!fs.existsSync("./qr_sessions")) {
+        fs.mkdirSync("./qr_sessions", { recursive: true });
     }
 
-    await removeFile(sessionFolder);
+    await removeFile(dirs);
 
     async function initiateSession() {
-        const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+        const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
         try {
             await connectDB();
@@ -45,10 +45,7 @@ router.get("/", async (req, res) => {
 
             let responseSent = false;
             let isConnectionOpen = false;
-            let sessionSaved = false;
             let qrGenerated = false;
-            let reconnectAttempts = 0;
-            const maxReconnectAttempts = 3;
 
             const KnightBot = makeWASocket({
                 version,
@@ -59,34 +56,33 @@ router.get("/", async (req, res) => {
                         pino({ level: "fatal" }).child({ level: "fatal" }),
                     ),
                 },
-                // Remove printQRInTerminal since it's deprecated
-                logger: pino({ level: "error" }).child({ level: "error" }), // Only log errors
+                printQRInTerminal: false,
+                logger: pino({ level: "silent" }).child({ level: "silent" }), // Silent logger
                 browser: Browsers.windows("Chrome"),
-                markOnlineOnConnect: false, // Changed to false
+                markOnlineOnConnect: true,
                 generateHighQualityLinkPreview: false,
                 defaultQueryTimeoutMs: 60000,
                 connectTimeoutMs: 60000,
-                keepAliveIntervalMs: 20000,
-                retryRequestDelayMs: 500,
+                keepAliveIntervalMs: 15000,
+                retryRequestDelayMs: 250,
                 maxRetries: 3,
                 emitOwnEvents: true,
                 fireInitQueries: true,
-                shouldIgnoreJid: (jid) => jid?.endsWith('@g.us') || jid?.endsWith('@broadcast'),
             });
 
             KnightBot.ev.on("connection.update", async (update) => {
-                const { connection, lastDisconnect, isNewLogin, qr } = update;
+                const { connection, lastDisconnect, qr, isNewLogin } = update;
 
-                console.log("🔧 Connection Update:", { 
-                    connection, 
+                console.log("🔧 Connection Update:", {
+                    connection,
                     qr: qr ? "QR Available" : "No QR",
-                    isNewLogin 
+                    isNewLogin
                 });
 
                 // Generate QR code
                 if (qr && !responseSent && !qrGenerated) {
                     qrGenerated = true;
-                    console.log("🟢 QR Code Generated!");
+                    console.log("🟢 QR Code Generated! Scan it with your WhatsApp app.");
 
                     try {
                         const qrDataURL = await QRCode.toDataURL(qr, {
@@ -125,126 +121,120 @@ router.get("/", async (req, res) => {
                     }
                 }
 
+                // Handle connection open
                 if (connection === "open") {
                     isConnectionOpen = true;
-                    reconnectAttempts = 0;
                     console.log("✅ Connected successfully!");
                     
-                    // IMPORTANT: Wait longer for WhatsApp to stabilize
-                    await delay(5000);
+                    // Wait for files to be created
+                    await delay(3000);
                     
-                    if (!sessionSaved) {
-                        console.log("📱 Checking for session files...");
+                    console.log("📱 Saving session files to MongoDB...");
+                    
+                    try {
+                        // Save each file individually
+                        const files = fs.readdirSync(dirs);
+                        let savedFiles = 0;
                         
-                        try {
-                            // Wait for creds.json to be created
-                            let retries = 10;
-                            while (retries > 0) {
-                                const credsPath = `${sessionFolder}/creds.json`;
-                                if (fs.existsSync(credsPath)) {
-                                    const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                                    console.log("📄 creds.json found and valid!");
-                                    
-                                    const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || `qr_${sessionId}`;
-                                    
-                                    console.log("📱 Saving session folder to MongoDB...");
-                                    const result = await saveSessionFolder(phoneNumber, 'qr', sessionFolder);
-                                    
-                                    console.log("✅ Session folder saved to MongoDB!");
-                                    console.log(`📋 Session ID: ${result.sessionId}`);
-                                    console.log(`📁 Files saved: ${result.filesCount}`);
-                                    
-                                    // Send success message
-                                    const userJid = jidNormalizedUser(KnightBot.authState.creds.me?.id || "");
-                                    if (userJid) {
-                                        try {
-                                            await KnightBot.sendMessage(userJid, {
-                                                text: `✅ WhatsApp QR session saved successfully!\n\n📱 Phone: ${phoneNumber}\n🔑 Session ID: ${result.sessionId}\n📁 Files: ${result.filesCount}\n\nYour session is now stored securely in the database.`,
-                                            });
-                                            console.log("📄 Success message sent");
-                                        } catch (sendError) {
-                                            console.error("❌ Error sending message:", sendError);
-                                        }
-                                    }
-                                    
-                                    sessionSaved = true;
-                                    
-                                    // Clean up local files after a delay
-                                    setTimeout(() => {
-                                        removeFile(sessionFolder);
-                                        console.log("🧹 Cleaned up local temp files");
-                                    }, 10000); // Give more time
-                                    
-                                    break;
-                                }
-                                console.log(`⏳ Waiting for creds.json... (${retries} retries left)`);
-                                await delay(1000);
-                                retries--;
-                            }
+                        for (const fileName of files) {
+                            const filePath = `${dirs}/${fileName}`;
+                            const stats = fs.statSync(filePath);
                             
-                            if (!sessionSaved) {
-                                console.log("❌ creds.json not found after waiting");
+                            if (stats.isFile()) {
+                                const fileData = fs.readFileSync(filePath);
+                                const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
+                                
+                                // Determine file type
+                                let fileType = 'other';
+                                if (fileName === 'creds.json') fileType = 'creds';
+                                else if (fileName.includes('auth')) fileType = 'auth';
+                                else if (fileName.includes('config')) fileType = 'config';
+                                
+                                // Create unique file name with timestamp
+                                const timestamp = Date.now();
+                                const uniqueFileName = `${timestamp}_${fileName}`;
+                                const virtualPath = `sessions/${phoneNumber}/${fileName}`;
+                                
+                                // Save file to database
+                                const sessionFile = new SessionFile({
+                                    phoneNumber,
+                                    fileName: uniqueFileName,
+                                    filePath: virtualPath,
+                                    fileData,
+                                    fileType,
+                                    sessionType: 'qr'
+                                });
+                                
+                                await sessionFile.save();
+                                savedFiles++;
+                                console.log(`📁 Saved: ${fileName} as ${uniqueFileName}`);
                             }
-                            
-                        } catch (error) {
-                            console.error("❌ Error saving QR session:", error);
                         }
+                        
+                        // Save session metadata
+                        const mongoSessionId = `qr_${sessionId}`;
+                        const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
+                        
+                        const sessionMeta = new SessionMeta({
+                            sessionId: mongoSessionId,
+                            phoneNumber,
+                            type: 'qr',
+                            status: 'active'
+                        });
+                        
+                        await sessionMeta.save();
+                        
+                        console.log(`✅ Saved ${savedFiles} files to MongoDB`);
+                        console.log(`📋 Session ID: ${mongoSessionId}`);
+                        
+                        // Send confirmation message
+                        try {
+                            const userJid = jidNormalizedUser(KnightBot.authState.creds.me?.id || "");
+                            if (userJid) {
+                                await KnightBot.sendMessage(userJid, {
+                                    text: `✅ WhatsApp session saved!\n\n📱 Phone: ${phoneNumber}\n🔑 Session ID: ${mongoSessionId}\n📁 Files: ${savedFiles}\n\nYour session is stored in database.`,
+                                });
+                                console.log("📄 Confirmation sent");
+                            }
+                        } catch (messageError) {
+                            console.error("❌ Could not send message:", messageError.message);
+                        }
+                        
+                    } catch (error) {
+                        console.error("❌ Error saving to MongoDB:", error);
                     }
                     
-                    // Don't keep connection alive aggressively - WhatsApp might disconnect
-                    const keepAliveInterval = setInterval(async () => {
+                    // Keep connection alive
+                    const keepAlive = setInterval(() => {
                         if (isConnectionOpen) {
-                            try {
-                                await KnightBot.sendPresenceUpdate('unavailable'); // Use unavailable instead of available
-                                console.log("💤 Presence updated (unavailable)");
-                            } catch (pingError) {
-                                console.error("Presence update error:", pingError);
-                                clearInterval(keepAliveInterval);
-                            }
+                            KnightBot.sendPresenceUpdate('available').catch(() => {
+                                // Ignore errors
+                            });
                         } else {
-                            clearInterval(keepAliveInterval);
+                            clearInterval(keepAlive);
                         }
-                    }, 60000); // Every 60 seconds
+                    }, 25000);
                 }
 
+                // Handle connection close
                 if (connection === "close") {
                     isConnectionOpen = false;
                     const statusCode = lastDisconnect?.error?.output?.statusCode;
-                    const error = lastDisconnect?.error;
                     
-                    console.log("🔌 Connection closed:", {
-                        statusCode,
-                        error: error?.message || "Unknown error"
-                    });
+                    console.log("🔌 Connection closed with status:", statusCode);
                     
-                    // Error 515 is normal after QR scan - it means restart is required
-                    if (statusCode === 515 || statusCode === 401) {
-                        console.log("🔄 This is expected after QR scan. Session should be saved.");
-                        
-                        if (!sessionSaved) {
-                            // Try to save session anyway
-                            try {
-                                await delay(2000);
-                                const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || `qr_${sessionId}`;
-                                
-                                if (fs.existsSync(sessionFolder)) {
-                                    console.log("🔄 Attempting to save session after disconnect...");
-                                    const result = await saveSessionFolder(phoneNumber, 'qr', sessionFolder);
-                                    console.log("✅ Session saved after disconnect!");
-                                    sessionSaved = true;
-                                }
-                            } catch (saveError) {
-                                console.error("❌ Failed to save after disconnect:", saveError);
-                            }
-                        }
-                    }
-                    
-                    // Clean up if session wasn't saved
-                    if (!sessionSaved) {
+                    if (statusCode === 515) {
+                        console.log("🔄 Normal disconnect after QR scan");
+                        // Don't clean up immediately - session might be saved
                         setTimeout(() => {
-                            removeFile(sessionFolder);
-                            console.log("🧹 Cleaned up unsaved QR session files");
-                        }, 3000);
+                            removeFile(dirs);
+                            console.log("🧹 Cleaned up session files");
+                        }, 10000);
+                    } else {
+                        setTimeout(() => {
+                            removeFile(dirs);
+                            console.log("🧹 Cleaned up unsaved session");
+                        }, 5000);
                     }
                 }
 
@@ -255,12 +245,7 @@ router.get("/", async (req, res) => {
 
             KnightBot.ev.on("creds.update", saveCreds);
 
-            // Handle connection errors
-            KnightBot.ev.on("connection.phone.code", (code) => {
-                console.log("📱 Phone code received:", code);
-            });
-
-            // Set timeout for QR generation
+            // Timeout for QR generation
             setTimeout(() => {
                 if (!responseSent) {
                     responseSent = true;
@@ -268,9 +253,9 @@ router.get("/", async (req, res) => {
                         code: "QR generation timeout",
                         message: "Please try again" 
                     });
-                    removeFile(sessionFolder);
+                    removeFile(dirs);
                 }
-            }, 60000); // 60 seconds timeout
+            }, 60000);
 
         } catch (err) {
             console.error("❌ Error initializing session:", err);
@@ -280,7 +265,7 @@ router.get("/", async (req, res) => {
                     message: "Failed to initialize session" 
                 });
             }
-            removeFile(sessionFolder);
+            removeFile(dirs);
         }
     }
 
