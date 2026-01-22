@@ -2,7 +2,6 @@
 import express from "express";
 import fs from "fs";
 import pino from "pino";
-import mongoose from "mongoose";
 import {
     makeWASocket,
     useMultiFileAuthState,
@@ -49,10 +48,10 @@ router.get("/", async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
         try {
-            // Connect to MongoDB
             await connectDB();
             
-            const { version, isLatest } = await fetchLatestBaileysVersion();
+            const { version } = await fetchLatestBaileysVersion();
+            
             let KnightBot = makeWASocket({
                 version,
                 auth: {
@@ -62,97 +61,124 @@ router.get("/", async (req, res) => {
                         pino({ level: "fatal" }).child({ level: "fatal" }),
                     ),
                 },
-                printQRInTerminal: false,
-                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+                printQRInTerminal: true,
+                logger: pino({ level: "info" }).child({ level: "info" }),
                 browser: Browsers.windows("Chrome"),
-                markOnlineOnConnect: false,
+                markOnlineOnConnect: true,
                 generateHighQualityLinkPreview: false,
                 defaultQueryTimeoutMs: 60000,
                 connectTimeoutMs: 60000,
-                keepAliveIntervalMs: 30000,
+                keepAliveIntervalMs: 10000,
                 retryRequestDelayMs: 250,
                 maxRetries: 5,
+                emitOwnEvents: true,
+                fireInitQueries: true,
             });
 
             let isConnectionOpen = false;
 
             KnightBot.ev.on("connection.update", async (update) => {
-                const { connection, lastDisconnect, isNewLogin, isOnline } =
-                    update;
+                const { connection, lastDisconnect, isNewLogin } = update;
+
+                console.log("🔧 Connection Update:", { connection, isNewLogin });
 
                 if (connection === "open") {
                     isConnectionOpen = true;
                     console.log("✅ Connected successfully!");
+                    
+                    await delay(2000);
+                    
                     console.log("📱 Saving session to MongoDB...");
-
+                    
                     try {
-                        // Read creds.json file
                         const credsPath = dirs + "/creds.json";
+                        let retries = 5;
+                        
+                        while (retries > 0 && !fs.existsSync(credsPath)) {
+                            console.log(`⏳ Waiting for creds.json... (${retries} retries left)`);
+                            await delay(1000);
+                            retries--;
+                        }
+                        
                         if (fs.existsSync(credsPath)) {
                             const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
                             
-                            // Create session ID
                             const mongoSessionId = `pair_${num}_${Date.now()}`;
-                            
-                            // Save to MongoDB
                             const sessionDoc = new Session({
                                 sessionId: mongoSessionId,
                                 phoneNumber: num,
                                 type: 'pair',
-                                credentials: credsData
+                                credentials: credsData,
+                                status: 'active'
                             });
                             
                             await sessionDoc.save();
-                            
                             console.log("✅ Session saved to MongoDB. Session ID:", mongoSessionId);
 
-                            const userJid = jidNormalizedUser(
-                                num + "@s.whatsapp.net",
-                            );
-
-                            await KnightBot.sendMessage(userJid, {
-                                text: mongoSessionId,
-                            });
-                            console.log("📄 Session ID sent successfully");
+                            const userJid = jidNormalizedUser(num + "@s.whatsapp.net");
+                            try {
+                                await KnightBot.sendMessage(userJid, {
+                                    text: `Session ID: ${mongoSessionId}\nYour WhatsApp session has been paired successfully!`,
+                                });
+                                console.log("📄 Session ID sent successfully");
+                            } catch (sendError) {
+                                console.error("❌ Error sending message:", sendError);
+                            }
+                            
+                            // Keep connection alive
+                            setInterval(async () => {
+                                if (isConnectionOpen) {
+                                    try {
+                                        await KnightBot.sendPresenceUpdate('available');
+                                        console.log("💓 Keep-alive ping sent");
+                                    } catch (pingError) {
+                                        console.error("Keep-alive error:", pingError);
+                                    }
+                                }
+                            }, 30000);
+                            
                         } else {
-                            console.log("❌ Creds file not found");
+                            console.log("❌ Creds file not found after waiting");
                         }
                     } catch (error) {
                         console.error("❌ Error saving to MongoDB:", error);
                     }
                     
-                    // Clean up local files
-                    await removeFile(dirs);
+                    console.log("📁 Session files kept for reconnection");
                 }
 
                 if (connection === "close") {
                     isConnectionOpen = false;
-                    const statusCode =
-                        lastDisconnect?.error?.output?.statusCode;
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+                    const error = lastDisconnect?.error;
+                    
+                    console.log("🔌 Connection closed:", {
+                        statusCode,
+                        error: error?.message || error
+                    });
 
                     if (statusCode === 401) {
-                        console.log(
-                            "❌ Logged out from WhatsApp. Need to generate new pair code.",
-                        );
+                        console.log("❌ Logged out from WhatsApp.");
+                        removeFile(dirs);
                     } else {
-                        console.log("🔁 Connection closed — restarting...");
-                        // Don't restart automatically
+                        console.log("⚠️ Connection lost. Will try to reconnect...");
+                        setTimeout(() => {
+                            if (!isConnectionOpen) {
+                                console.log("🔄 Attempting to reconnect...");
+                                initiateSession();
+                            }
+                        }, 5000);
                     }
                 }
 
                 if (isNewLogin) {
                     console.log("🔐 New login via pair code");
                 }
-
-                if (isOnline) {
-                    console.log("📶 Client is online");
-                }
             });
 
             KnightBot.ev.on("creds.update", async (creds) => {
                 saveCreds(creds);
                 
-                // Update MongoDB when creds are updated
                 if (isConnectionOpen) {
                     try {
                         const credsPath = dirs + "/creds.json";
@@ -163,7 +189,8 @@ router.get("/", async (req, res) => {
                                 { phoneNumber: num, type: 'pair' },
                                 { 
                                     credentials: credsData,
-                                    lastUpdated: new Date()
+                                    lastUpdated: new Date(),
+                                    status: 'active'
                                 },
                                 { upsert: true, new: true }
                             );
@@ -197,13 +224,8 @@ router.get("/", async (req, res) => {
                 }
             }
 
-            // Handle process cleanup
-            process.on('beforeExit', () => {
-                removeFile(dirs);
-            });
-
         } catch (err) {
-            console.error("Error initializing session:", err);
+            console.error("❌ Error initializing session:", err);
             if (!res.headersSent) {
                 res.status(503).send({ code: "Service Unavailable" });
             }
@@ -211,25 +233,6 @@ router.get("/", async (req, res) => {
     }
 
     await initiateSession();
-});
-
-process.on("uncaughtException", (err) => {
-    let e = String(err);
-    if (e.includes("conflict")) return;
-    if (e.includes("not-authorized")) return;
-    if (e.includes("Socket connection timeout")) return;
-    if (e.includes("rate-overlimit")) return;
-    if (e.includes("Connection Closed")) return;
-    if (e.includes("Timed Out")) return;
-    if (e.includes("Value not found")) return;
-    if (
-        e.includes("Stream Errored") ||
-        e.includes("Stream Errored (restart required)")
-    )
-        return;
-    if (e.includes("statusCode: 515") || e.includes("statusCode: 503")) return;
-    console.log("Caught exception: ", err);
-    // Don't exit process
 });
 
 export default router;
