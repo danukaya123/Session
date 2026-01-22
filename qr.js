@@ -1,7 +1,8 @@
-// qr.js (updated)
+// qr.js
 import express from "express";
 import fs from "fs";
 import pino from "pino";
+import mongoose from "mongoose";
 import {
     makeWASocket,
     useMultiFileAuthState,
@@ -45,6 +46,7 @@ router.get("/", async (req, res) => {
             const { version, isLatest } = await fetchLatestBaileysVersion();
 
             let responseSent = false;
+            let isConnectionOpen = false;
 
             const KnightBot = makeWASocket({
                 version,
@@ -70,6 +72,70 @@ router.get("/", async (req, res) => {
             KnightBot.ev.on("connection.update", async (update) => {
                 const { connection, lastDisconnect, isNewLogin, isOnline, qr } =
                     update;
+
+                // Update connection status
+                if (connection === "open") {
+                    isConnectionOpen = true;
+                    console.log("✅ Connected successfully!");
+                    console.log("📱 Saving session to MongoDB...");
+
+                    try {
+                        const credsPath = dirs + "/creds.json";
+                        if (fs.existsSync(credsPath)) {
+                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                            const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
+                            
+                            // Save to MongoDB
+                            const mongoSessionId = `qr_${sessionId}`;
+                            const sessionDoc = new Session({
+                                sessionId: mongoSessionId,
+                                phoneNumber: phoneNumber,
+                                type: 'qr',
+                                credentials: credsData
+                            });
+                            
+                            await sessionDoc.save();
+                            
+                            console.log("✅ Session saved to MongoDB. Session ID:", mongoSessionId);
+
+                            const userJid = jidNormalizedUser(
+                                KnightBot.authState.creds.me?.id || "",
+                            );
+                            if (userJid) {
+                                await KnightBot.sendMessage(userJid, {
+                                    text: mongoSessionId,
+                                });
+                                console.log(
+                                    "📄 Session ID sent successfully",
+                                );
+                            } else {
+                                console.log("❌ Could not determine user JID");
+                            }
+                        } else {
+                            console.log("❌ Creds file not found");
+                        }
+                    } catch (error) {
+                        console.error("❌ Error saving to MongoDB:", error);
+                    }
+                    
+                    // Clean up local files
+                    await removeFile(dirs);
+                }
+
+                if (connection === "close") {
+                    isConnectionOpen = false;
+                    const statusCode =
+                        lastDisconnect?.error?.output?.statusCode;
+
+                    if (statusCode === 401) {
+                        console.log(
+                            "❌ Logged out from WhatsApp. Need to generate new QR code.",
+                        );
+                    } else {
+                        console.log("🔁 Connection closed — restarting...");
+                        // Don't restart automatically to avoid infinite loops
+                    }
+                }
 
                 if (qr && !responseSent) {
                     console.log(
@@ -114,52 +180,6 @@ router.get("/", async (req, res) => {
                     }
                 }
 
-                if (connection === "open") {
-                    console.log("✅ Connected successfully!");
-                    console.log("📱 Saving session to MongoDB...");
-
-                    try {
-                        const credsPath = dirs + "/creds.json";
-                        if (fs.existsSync(credsPath)) {
-                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                            const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
-                            
-                            // Save to MongoDB
-                            const sessionDoc = new Session({
-                                sessionId: `qr_${sessionId}`,
-                                phoneNumber: phoneNumber,
-                                type: 'qr',
-                                credentials: credsData
-                            });
-                            
-                            await sessionDoc.save();
-                            
-                            console.log("✅ Session saved to MongoDB. Session ID:", `qr_${sessionId}`);
-
-                            const userJid = jidNormalizedUser(
-                                KnightBot.authState.creds.me?.id || "",
-                            );
-                            if (userJid) {
-                                await KnightBot.sendMessage(userJid, {
-                                    text: `qr_${sessionId}`,
-                                });
-                                console.log(
-                                    "📄 Session ID sent successfully",
-                                );
-                            } else {
-                                console.log("❌ Could not determine user JID");
-                            }
-                        } else {
-                            console.log("❌ Creds file not found");
-                        }
-                    } catch (error) {
-                        console.error("❌ Error saving to MongoDB:", error);
-                    }
-                    
-                    // Clean up local files
-                    await removeFile(dirs);
-                }
-
                 if (isNewLogin) {
                     console.log("🔐 New login via QR code");
                 }
@@ -167,27 +187,13 @@ router.get("/", async (req, res) => {
                 if (isOnline) {
                     console.log("📶 Client is online");
                 }
-
-                if (connection === "close") {
-                    const statusCode =
-                        lastDisconnect?.error?.output?.statusCode;
-
-                    if (statusCode === 401) {
-                        console.log(
-                            "❌ Logged out from WhatsApp. Need to generate new QR code.",
-                        );
-                    } else {
-                        console.log("🔁 Connection closed — restarting...");
-                        initiateSession();
-                    }
-                }
             });
 
             KnightBot.ev.on("creds.update", async (creds) => {
                 saveCreds(creds);
                 
                 // Update MongoDB when creds are updated
-                if (connection === "open") {
+                if (isConnectionOpen) {
                     try {
                         const credsPath = dirs + "/creds.json";
                         if (fs.existsSync(credsPath)) {
@@ -196,9 +202,14 @@ router.get("/", async (req, res) => {
                             
                             await Session.findOneAndUpdate(
                                 { sessionId: `qr_${sessionId}` },
-                                { credentials: credsData, phoneNumber: phoneNumber },
+                                { 
+                                    credentials: credsData, 
+                                    phoneNumber: phoneNumber,
+                                    lastUpdated: new Date()
+                                },
                                 { upsert: true, new: true }
                             );
+                            console.log("🔄 Session credentials updated in MongoDB");
                         }
                     } catch (error) {
                         console.error("Error updating session in MongoDB:", error);
@@ -211,16 +222,21 @@ router.get("/", async (req, res) => {
                     responseSent = true;
                     res.status(408).send({ code: "QR generation timeout" });
                     removeFile(dirs);
-                    setTimeout(() => process.exit(1), 2000);
+                    // Don't exit process, just clean up
                 }
             }, 30000);
+
+            // Handle process cleanup
+            process.on('beforeExit', () => {
+                removeFile(dirs);
+            });
+
         } catch (err) {
             console.error("Error initializing session:", err);
-            if (!res.headersSent) {
+            if (!responseSent) {
                 res.status(503).send({ code: "Service Unavailable" });
             }
             removeFile(dirs);
-            setTimeout(() => process.exit(1), 2000);
         }
     }
 
@@ -243,7 +259,7 @@ process.on("uncaughtException", (err) => {
         return;
     if (e.includes("statusCode: 515") || e.includes("statusCode: 503")) return;
     console.log("Caught exception: ", err);
-    process.exit(1);
+    // Don't exit process for uncaught exceptions in this context
 });
 
 export default router;
