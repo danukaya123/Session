@@ -11,7 +11,8 @@ import {
     fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import pn from "awesome-phonenumber";
-import { sessionDB } from "./database.js";
+import { upload } from "./mega.js";
+import { url } from "inspector";
 
 const router = express.Router();
 
@@ -21,6 +22,16 @@ function removeFile(FilePath) {
         fs.rmSync(FilePath, { recursive: true, force: true });
     } catch (e) {
         console.error("Error removing file:", e);
+    }
+}
+
+function getMegaFileId(url) {
+    try {
+        // Extract everything after /file/ including the key
+        const match = url.match(/\/file\/([^#]+#[^\/]+)/);
+        return match ? match[1] : null;
+    } catch (error) {
+        return null;
     }
 }
 
@@ -75,50 +86,35 @@ router.get("/", async (req, res) => {
 
                 if (connection === "open") {
                     console.log("✅ Connected successfully!");
-                    console.log("📱 Saving session to MongoDB...");
+                    console.log("📱 Uploading session to MEGA...");
 
                     try {
-                        // Read credentials from file
                         const credsPath = dirs + "/creds.json";
-                        if (fs.existsSync(credsPath)) {
-                            const credentials = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                            
-                            // Save to MongoDB
-                            const savedSession = await sessionDB.saveSession({
-                                phoneNumber: num,
-                                sessionType: 'pair',
-                                credentials: credentials,
-                                deviceInfo: {
-                                    platform: 'web',
-                                    browser: 'Chrome',
-                                    userAgent: req.headers['user-agent'] || 'Unknown'
-                                }
-                            });
-                            
-                            console.log("✅ Session saved to MongoDB with ID:", savedSession._id);
-                            console.log("📄 Document saved in 'sessions' collection");
+                        const megaUrl = await upload(
+                            credsPath,
+                            `creds_${num}_${Date.now()}.json`,
+                        );
+                        const megaFileId = getMegaFileId(megaUrl);
 
-                            // Send confirmation
+                        if (megaFileId) {
+                            console.log(
+                                "✅ Session uploaded to MEGA. File ID:",
+                                megaFileId,
+                            );
+
                             const userJid = jidNormalizedUser(
                                 num + "@s.whatsapp.net",
                             );
 
                             await KnightBot.sendMessage(userJid, {
-                                text: `✅ Session saved successfully!\n\nSession ID: ${num}\nMongoDB ID: ${savedSession._id}\n\nYour bot will now connect automatically.`,
+                                text: `${megaFileId}`,
                             });
-                            console.log("📩 Confirmation sent to user");
-                            
-                            // IMPORTANT: Don't close immediately, wait 10 seconds
-                            setTimeout(() => {
-                                console.log("🔄 Closing connection gracefully...");
-                                // End connection properly
-                                KnightBot.end(undefined);
-                                // Clean up files
-                                removeFile(dirs);
-                            }, 10000);
+                            console.log("📄 MEGA file ID sent successfully");
+                        } else {
+                            console.log("❌ Failed to upload to MEGA");
                         }
                     } catch (error) {
-                        console.error("❌ Error saving to MongoDB:", error);
+                        console.error("❌ Error uploading to MEGA:", error);
                     }
                 }
 
@@ -131,22 +127,22 @@ router.get("/", async (req, res) => {
                 }
 
                 if (connection === "close") {
-                    const statusCode = lastDisconnect?.error?.output?.statusCode;
-                    
-                    console.log(`🔌 Connection closed with status: ${statusCode}`);
-                    
-                    // DON'T restart session if it was a successful connection
-                    // Only restart if it's an actual error (not 0 or undefined)
-                    if (statusCode && statusCode !== 0 && statusCode !== 401) {
-                        console.log("🔁 Error detected - restarting...");
-                        // Don't actually restart - just log
-                        // initiateSession();
+                    const statusCode =
+                        lastDisconnect?.error?.output?.statusCode;
+
+                    if (statusCode === 401) {
+                        console.log(
+                            "❌ Logged out from WhatsApp. Need to generate new pair code.",
+                        );
+                    } else {
+                        console.log("🔁 Connection closed — restarting...");
+                        initiateSession();
                     }
                 }
             });
 
             if (!KnightBot.authState.creds.registered) {
-                await delay(3000);
+                await delay(3000); // Wait 3 seconds before requesting pairing code
                 num = num.replace(/[^\d+]/g, "");
                 if (num.startsWith("+")) num = num.substring(1);
 
@@ -190,7 +186,11 @@ process.on("uncaughtException", (err) => {
     if (e.includes("Connection Closed")) return;
     if (e.includes("Timed Out")) return;
     if (e.includes("Value not found")) return;
-    if (e.includes("Stream Errored") || e.includes("Stream Errored (restart required)")) return;
+    if (
+        e.includes("Stream Errored") ||
+        e.includes("Stream Errored (restart required)")
+    )
+        return;
     if (e.includes("statusCode: 515") || e.includes("statusCode: 503")) return;
     console.log("Caught exception: ", err);
     process.exit(1);
