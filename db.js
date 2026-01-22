@@ -12,11 +12,7 @@ export async function connectDB() {
     }
 
     try {
-        await mongoose.connect(MONGODB_URI, {
-            // Remove useNewUrlParser and useUnifiedTopology
-            // These are not needed in Mongoose 6+
-        });
-        
+        await mongoose.connect(MONGODB_URI);
         isConnected = true;
         console.log('✅ MongoDB Connected Successfully');
     } catch (error) {
@@ -25,21 +21,17 @@ export async function connectDB() {
     }
 }
 
-// Session Schema
+// Session Schema - Simplified without duplicate indexes
 const sessionSchema = new mongoose.Schema({
     sessionId: {
         type: String,
         required: true,
-        unique: true,
-        index: true
+        unique: true
     },
-    phoneNumber: {
-        type: String,
-        index: true
-    },
+    phoneNumber: String,
     type: {
         type: String,
-        enum: ['pair', 'qr'],
+        enum: ['pair', 'qr', 'test'], // Added 'test' for testing
         default: 'pair'
     },
     credentials: {
@@ -49,19 +41,28 @@ const sessionSchema = new mongoose.Schema({
     createdAt: {
         type: Date,
         default: Date.now,
-        expires: 2592000 // 30 days in seconds
+        index: { expires: '30d' } // Auto delete after 30 days
     },
     lastUpdated: {
         type: Date,
         default: Date.now
+    },
+    status: {
+        type: String,
+        enum: ['active', 'inactive', 'expired'],
+        default: 'active'
     }
+}, {
+    // Collection name
+    collection: 'whatsapp_sessions'
 });
 
-// Create indexes for better performance
+// Create compound indexes for better query performance
+sessionSchema.index({ phoneNumber: 1, type: 1 });
 sessionSchema.index({ createdAt: 1 });
-sessionSchema.index({ type: 1, phoneNumber: 1 });
+sessionSchema.index({ status: 1 });
 
-export const Session = mongoose.models.Session || mongoose.model('Session', sessionSchema, 'whatsapp_sessions');
+export const Session = mongoose.models.Session || mongoose.model('Session', sessionSchema);
 
 // Handle connection events
 mongoose.connection.on('connected', () => {
