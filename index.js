@@ -23,8 +23,13 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(__dirname));
 
-// Initialize MongoDB connection
-connectDB().catch(console.error);
+// Initialize MongoDB connection with error handling
+connectDB().then(() => {
+    console.log('✅ Database connection established');
+}).catch(err => {
+    console.error('❌ Failed to connect to database:', err);
+    console.log('⚠️  Server will continue running, but database features may not work');
+});
 
 app.get("/", (req, res) => {
     res.sendFile(path.join(__dirname, "pair.html"));
@@ -33,8 +38,20 @@ app.get("/", (req, res) => {
 app.use("/pair", pairRouter);
 app.use("/qr", qrRouter);
 
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({ 
+        success: false, 
+        message: 'Internal Server Error',
+        error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+    console.log(`📱 Pair Code endpoint: http://0.0.0.0:${PORT}/pair`);
+    console.log(`🔗 QR Code endpoint: http://0.0.0.0:${PORT}/qr`);
 });
 
 export default app;
