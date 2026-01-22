@@ -1,8 +1,7 @@
 // db.js - SIMPLE VERSION
 import mongoose from 'mongoose';
 
-const MONGODB_URI = process.env.MONGODB_URI;
-
+const MONGODB_URI = 'mongodb+srv://whatsappBotUser:IuAwNhOpza2YgrHo@mybot.7iuajoj.mongodb.net/MyBot?retryWrites=true&w=majority';
 let isConnected = false;
 
 export async function connectDB() {
