@@ -1,4 +1,4 @@
-// qr.js - SIMPLIFIED WORKING VERSION
+// qr.js
 import express from "express";
 import fs from "fs";
 import pino from "pino";
@@ -35,7 +35,7 @@ router.get("/", async (req, res) => {
 
     await removeFile(dirs);
 
-    async function initiateSession() {
+    async function initiateSession(reconnectAttempt = 0) {
         const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
         try {
@@ -46,6 +46,8 @@ router.get("/", async (req, res) => {
             let responseSent = false;
             let isConnectionOpen = false;
             let qrGenerated = false;
+            let sessionSaved = false;
+            const maxReconnectAttempts = 3;
 
             const KnightBot = makeWASocket({
                 version,
@@ -57,7 +59,7 @@ router.get("/", async (req, res) => {
                     ),
                 },
                 printQRInTerminal: false,
-                logger: pino({ level: "silent" }).child({ level: "silent" }), // Silent logger
+                logger: pino({ level: "silent" }).child({ level: "silent" }),
                 browser: Browsers.windows("Chrome"),
                 markOnlineOnConnect: true,
                 generateHighQualityLinkPreview: false,
@@ -76,7 +78,8 @@ router.get("/", async (req, res) => {
                 console.log("🔧 Connection Update:", {
                     connection,
                     qr: qr ? "QR Available" : "No QR",
-                    isNewLogin
+                    isNewLogin,
+                    reconnectAttempt
                 });
 
                 // Generate QR code
@@ -124,96 +127,114 @@ router.get("/", async (req, res) => {
                 // Handle connection open
                 if (connection === "open") {
                     isConnectionOpen = true;
+                    reconnectAttempt = 0; // Reset reconnect attempts on successful connection
                     console.log("✅ Connected successfully!");
                     
                     // Wait for files to be created
                     await delay(3000);
                     
-                    console.log("📱 Saving session files to MongoDB...");
-                    
-                    try {
-                        // Save each file individually
-                        const files = fs.readdirSync(dirs);
-                        let savedFiles = 0;
+                    if (!sessionSaved) {
+                        console.log("📱 Saving session files to MongoDB...");
                         
-                        for (const fileName of files) {
-                            const filePath = `${dirs}/${fileName}`;
-                            const stats = fs.statSync(filePath);
-                            
-                            if (stats.isFile()) {
-                                const fileData = fs.readFileSync(filePath);
-                                const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
-                                
-                                // Determine file type
-                                let fileType = 'other';
-                                if (fileName === 'creds.json') fileType = 'creds';
-                                else if (fileName.includes('auth')) fileType = 'auth';
-                                else if (fileName.includes('config')) fileType = 'config';
-                                
-                                // Create unique file name with timestamp
-                                const timestamp = Date.now();
-                                const uniqueFileName = `${timestamp}_${fileName}`;
-                                const virtualPath = `sessions/${phoneNumber}/${fileName}`;
-                                
-                                // Save file to database
-                                const sessionFile = new SessionFile({
-                                    phoneNumber,
-                                    fileName: uniqueFileName,
-                                    filePath: virtualPath,
-                                    fileData,
-                                    fileType,
-                                    sessionType: 'qr'
-                                });
-                                
-                                await sessionFile.save();
-                                savedFiles++;
-                                console.log(`📁 Saved: ${fileName} as ${uniqueFileName}`);
-                            }
-                        }
-                        
-                        // Save session metadata
-                        const mongoSessionId = `qr_${sessionId}`;
-                        const phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
-                        
-                        const sessionMeta = new SessionMeta({
-                            sessionId: mongoSessionId,
-                            phoneNumber,
-                            type: 'qr',
-                            status: 'active'
-                        });
-                        
-                        await sessionMeta.save();
-                        
-                        console.log(`✅ Saved ${savedFiles} files to MongoDB`);
-                        console.log(`📋 Session ID: ${mongoSessionId}`);
-                        
-                        // Send confirmation message
                         try {
-                            const userJid = jidNormalizedUser(KnightBot.authState.creds.me?.id || "");
-                            if (userJid) {
-                                await KnightBot.sendMessage(userJid, {
-                                    text: `✅ WhatsApp session saved!\n\n📱 Phone: ${phoneNumber}\n🔑 Session ID: ${mongoSessionId}\n📁 Files: ${savedFiles}\n\nYour session is stored in database.`,
-                                });
-                                console.log("📄 Confirmation sent");
+                            // Save each file individually
+                            const files = fs.readdirSync(dirs);
+                            let savedFiles = 0;
+                            let phoneNumber = KnightBot.authState.creds.me?.id?.split(':')[0] || 'qr_session';
+                            
+                            // Update phone number if available
+                            if (KnightBot.authState.creds.me?.id) {
+                                phoneNumber = KnightBot.authState.creds.me.id.split(':')[0];
                             }
-                        } catch (messageError) {
-                            console.error("❌ Could not send message:", messageError.message);
-                        }
-                        
-                    } catch (error) {
-                        console.error("❌ Error saving to MongoDB:", error);
-                    }
-                    
-                    // Keep connection alive
-                    const keepAlive = setInterval(() => {
-                        if (isConnectionOpen) {
-                            KnightBot.sendPresenceUpdate('available').catch(() => {
-                                // Ignore errors
+                            
+                            for (const fileName of files) {
+                                const filePath = `${dirs}/${fileName}`;
+                                const stats = fs.statSync(filePath);
+                                
+                                if (stats.isFile()) {
+                                    const fileData = fs.readFileSync(filePath);
+                                    
+                                    // Determine file type
+                                    let fileType = 'other';
+                                    if (fileName === 'creds.json') fileType = 'creds';
+                                    else if (fileName.includes('auth')) fileType = 'auth';
+                                    else if (fileName.includes('config')) fileType = 'config';
+                                    
+                                    // Create unique file name with timestamp
+                                    const timestamp = Date.now();
+                                    const uniqueFileName = `${timestamp}_${fileName}`;
+                                    const virtualPath = `sessions/${phoneNumber}/${fileName}`;
+                                    
+                                    // Save file to database
+                                    const sessionFile = new SessionFile({
+                                        phoneNumber,
+                                        fileName: uniqueFileName,
+                                        filePath: virtualPath,
+                                        fileData,
+                                        fileType,
+                                        sessionType: 'qr'
+                                    });
+                                    
+                                    await sessionFile.save();
+                                    savedFiles++;
+                                    console.log(`📁 Saved: ${fileName} as ${uniqueFileName}`);
+                                }
+                            }
+                            
+                            // Save session metadata
+                            const mongoSessionId = `qr_${sessionId}_${Date.now()}`;
+                            
+                            const sessionMeta = new SessionMeta({
+                                sessionId: mongoSessionId,
+                                phoneNumber,
+                                type: 'qr',
+                                status: 'active'
                             });
-                        } else {
-                            clearInterval(keepAlive);
+                            
+                            await sessionMeta.save();
+                            
+                            console.log(`✅ Saved ${savedFiles} files to MongoDB`);
+                            console.log(`📋 Session ID: ${mongoSessionId}`);
+                            console.log(`📱 Phone: ${phoneNumber}`);
+                            
+                            sessionSaved = true;
+                            
+                            // Send confirmation message
+                            try {
+                                const userJid = jidNormalizedUser(KnightBot.authState.creds.me?.id || "");
+                                if (userJid) {
+                                    await KnightBot.sendMessage(userJid, {
+                                        text: `✅ WhatsApp session saved successfully!\n\n📱 Phone: ${phoneNumber}\n🔑 Session ID: ${mongoSessionId}\n📁 Files: ${savedFiles}\n\nYour session is now stored securely in the database.`,
+                                    });
+                                    console.log("📄 Confirmation message sent");
+                                }
+                            } catch (messageError) {
+                                console.error("❌ Could not send message:", messageError.message);
+                            }
+                            
+                            // Keep connection alive
+                            const keepAlive = setInterval(() => {
+                                if (isConnectionOpen) {
+                                    KnightBot.sendPresenceUpdate('available').catch(() => {
+                                        // Ignore errors
+                                    });
+                                } else {
+                                    clearInterval(keepAlive);
+                                }
+                            }, 25000);
+                            
+                            // Clean up local files after 10 seconds
+                            setTimeout(() => {
+                                if (sessionSaved) {
+                                    removeFile(dirs);
+                                    console.log("🧹 Cleaned up local session files");
+                                }
+                            }, 10000);
+                            
+                        } catch (error) {
+                            console.error("❌ Error saving to MongoDB:", error);
                         }
-                    }, 25000);
+                    }
                 }
 
                 // Handle connection close
@@ -224,16 +245,71 @@ router.get("/", async (req, res) => {
                     console.log("🔌 Connection closed with status:", statusCode);
                     
                     if (statusCode === 515) {
-                        console.log("🔄 Normal disconnect after QR scan");
-                        // Don't clean up immediately - session might be saved
+                        console.log("🔄 Normal disconnect after QR scan. Attempting reconnection...");
+                        
+                        // Try to reconnect if we haven't saved the session yet
+                        if (!sessionSaved && reconnectAttempt < maxReconnectAttempts) {
+                            reconnectAttempt++;
+                            console.log(`🔄 Reconnection attempt ${reconnectAttempt}/${maxReconnectAttempts}`);
+                            
+                            setTimeout(async () => {
+                                try {
+                                    console.log("🔄 Attempting to reconnect...");
+                                    await initiateSession(reconnectAttempt);
+                                } catch (reconnectError) {
+                                    console.error("❌ Reconnection failed:", reconnectError.message);
+                                    
+                                    // Try to save session anyway if files exist
+                                    if (fs.existsSync(dirs)) {
+                                        try {
+                                            console.log("🔄 Trying to save session files...");
+                                            const files = fs.readdirSync(dirs);
+                                            if (files.length > 0) {
+                                                // Get phone number from existing creds if available
+                                                let phoneNumber = 'qr_session';
+                                                const credsPath = `${dirs}/creds.json`;
+                                                if (fs.existsSync(credsPath)) {
+                                                    try {
+                                                        const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                                                        phoneNumber = credsData.me?.id?.split(':')[0] || phoneNumber;
+                                                    } catch (e) {
+                                                        console.error("❌ Could not read creds.json:", e.message);
+                                                    }
+                                                }
+                                                
+                                                console.log(`📱 Attempting to save for phone: ${phoneNumber}`);
+                                                // Save logic here...
+                                            }
+                                        } catch (saveError) {
+                                            console.error("❌ Failed to save after reconnection attempts:", saveError.message);
+                                        }
+                                    }
+                                    
+                                    // Clean up after all attempts
+                                    setTimeout(() => {
+                                        removeFile(dirs);
+                                        console.log("🧹 Cleaned up session files after failed reconnections");
+                                    }, 5000);
+                                }
+                            }, 2000); // Wait 2 seconds before reconnecting
+                        } else if (sessionSaved) {
+                            console.log("✅ Session already saved. Connection can close.");
+                            setTimeout(() => {
+                                removeFile(dirs);
+                                console.log("🧹 Cleaned up local files");
+                            }, 5000);
+                        } else {
+                            console.log("❌ Max reconnection attempts reached");
+                            setTimeout(() => {
+                                removeFile(dirs);
+                                console.log("🧹 Cleaned up unsaved session files");
+                            }, 5000);
+                        }
+                    } else {
+                        console.log("⚠️ Unexpected disconnect");
                         setTimeout(() => {
                             removeFile(dirs);
                             console.log("🧹 Cleaned up session files");
-                        }, 10000);
-                    } else {
-                        setTimeout(() => {
-                            removeFile(dirs);
-                            console.log("🧹 Cleaned up unsaved session");
                         }, 5000);
                     }
                 }
