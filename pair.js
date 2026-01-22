@@ -1,3 +1,4 @@
+// pair.js (updated)
 import express from "express";
 import fs from "fs";
 import pino from "pino";
@@ -11,8 +12,7 @@ import {
     fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import pn from "awesome-phonenumber";
-import { upload } from "./mega.js";
-import { url } from "inspector";
+import { connectDB, Session } from "./db.js";
 
 const router = express.Router();
 
@@ -22,16 +22,6 @@ function removeFile(FilePath) {
         fs.rmSync(FilePath, { recursive: true, force: true });
     } catch (e) {
         console.error("Error removing file:", e);
-    }
-}
-
-function getMegaFileId(url) {
-    try {
-        // Extract everything after /file/ including the key
-        const match = url.match(/\/file\/([^#]+#[^\/]+)/);
-        return match ? match[1] : null;
-    } catch (error) {
-        return null;
     }
 }
 
@@ -58,6 +48,9 @@ router.get("/", async (req, res) => {
         const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
         try {
+            // Connect to MongoDB
+            await connectDB();
+            
             const { version, isLatest } = await fetchLatestBaileysVersion();
             let KnightBot = makeWASocket({
                 version,
@@ -86,36 +79,46 @@ router.get("/", async (req, res) => {
 
                 if (connection === "open") {
                     console.log("✅ Connected successfully!");
-                    console.log("📱 Uploading session to MEGA...");
+                    console.log("📱 Saving session to MongoDB...");
 
                     try {
+                        // Read creds.json file
                         const credsPath = dirs + "/creds.json";
-                        const megaUrl = await upload(
-                            credsPath,
-                            `creds_${num}_${Date.now()}.json`,
-                        );
-                        const megaFileId = getMegaFileId(megaUrl);
-
-                        if (megaFileId) {
-                            console.log(
-                                "✅ Session uploaded to MEGA. File ID:",
-                                megaFileId,
-                            );
+                        if (fs.existsSync(credsPath)) {
+                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                            
+                            // Create session ID
+                            const sessionId = `pair_${num}_${Date.now()}`;
+                            
+                            // Save to MongoDB
+                            const sessionDoc = new Session({
+                                sessionId: sessionId,
+                                phoneNumber: num,
+                                type: 'pair',
+                                credentials: credsData
+                            });
+                            
+                            await sessionDoc.save();
+                            
+                            console.log("✅ Session saved to MongoDB. Session ID:", sessionId);
 
                             const userJid = jidNormalizedUser(
                                 num + "@s.whatsapp.net",
                             );
 
                             await KnightBot.sendMessage(userJid, {
-                                text: `${megaFileId}`,
+                                text: `${sessionId}`,
                             });
-                            console.log("📄 MEGA file ID sent successfully");
+                            console.log("📄 Session ID sent successfully");
                         } else {
-                            console.log("❌ Failed to upload to MEGA");
+                            console.log("❌ Creds file not found");
                         }
                     } catch (error) {
-                        console.error("❌ Error uploading to MEGA:", error);
+                        console.error("❌ Error saving to MongoDB:", error);
                     }
+                    
+                    // Clean up local files
+                    await removeFile(dirs);
                 }
 
                 if (isNewLogin) {
@@ -141,8 +144,30 @@ router.get("/", async (req, res) => {
                 }
             });
 
+            KnightBot.ev.on("creds.update", async (creds) => {
+                saveCreds(creds);
+                
+                // Update MongoDB when creds are updated
+                if (connection === "open") {
+                    try {
+                        const credsPath = dirs + "/creds.json";
+                        if (fs.existsSync(credsPath)) {
+                            const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                            
+                            await Session.findOneAndUpdate(
+                                { phoneNumber: num },
+                                { credentials: credsData },
+                                { upsert: true, new: true }
+                            );
+                        }
+                    } catch (error) {
+                        console.error("Error updating session in MongoDB:", error);
+                    }
+                }
+            });
+
             if (!KnightBot.authState.creds.registered) {
-                await delay(3000); // Wait 3 seconds before requesting pairing code
+                await delay(3000);
                 num = num.replace(/[^\d+]/g, "");
                 if (num.startsWith("+")) num = num.substring(1);
 
@@ -163,8 +188,6 @@ router.get("/", async (req, res) => {
                     setTimeout(() => process.exit(1), 2000);
                 }
             }
-
-            KnightBot.ev.on("creds.update", saveCreds);
         } catch (err) {
             console.error("Error initializing session:", err);
             if (!res.headersSent) {
