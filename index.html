@@ -861,7 +861,7 @@
         qrDisplay.style.display = "none";
 
         try {
-          const response = await axios("/qr");
+          const response = await axios("https://danuka-0308-c17231e200e4.herokuapp.com/qr");
 
           if (response.data.qr) {
             document.getElementById("qrImage").src = response.data.qr;
@@ -912,7 +912,7 @@
 
         try {
           const response = await axios(
-            `/pair?number=${mobileNumber.replace(/[^0-9]/g, "")}`,
+            `https://danuka-0308-c17231e200e4.herokuapp.com/pair?number=${mobileNumber.replace(/[^0-9]/g, "")}`,
           );
 
           const code = response.data.code || "SERVICE UNAVAILABLE";
