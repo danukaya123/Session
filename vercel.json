@@ -1,8 +1,27 @@
 {
   "rewrites": [
     {
+      "source": "/api/qr",
+      "destination": "https://danuka-0308-c17231e200e4.herokuapp.com/qr"
+    },
+    {
+      "source": "/api/pair",
+      "destination": "https://danuka-0308-c17231e200e4.herokuapp.com/pair"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        }
+      ]
     }
   ]
 }
